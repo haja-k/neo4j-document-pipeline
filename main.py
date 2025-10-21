@@ -40,7 +40,7 @@ def is_complex_question(q: str) -> bool:
 # ---------- Request schema ----------
 class RagBody(BaseModel):
     question: str = Field(..., description="User question")
-    top_k: int = 8
+    top_k: int = 7
     hops: int = 1
     labels: Optional[List[str]] = None
     use_hybrid: bool = True
@@ -48,7 +48,6 @@ class RagBody(BaseModel):
     beta_kw: float = 0.25
     use_mmr: bool = True
     use_cross_doc: bool = True
-    # None = AUTO (heuristic), True = force decompose, False = never decompose
     decompose: Optional[bool] = False
 
 @app.get("/test")
@@ -72,27 +71,25 @@ def graphrag(body: RagBody = Body(...)):
         return {"answer": "Please provide a question.", "facts": "", "seeds": []}
 
     q0 = body.question.strip()
-    # AUTO when decompose is None; else honor True/False
+
+    # Decomposition: AUTO when decompose is None; else honor True/False
     if body.decompose is True:
         questions = decompose_question(q0, max_parts=3) or [q0]
     elif body.decompose is False:
         questions = [q0]
     else:
-        # AUTO (heuristic)
-        if is_complex_question(q0):
-            questions = decompose_question(q0, max_parts=3) or [q0]
-        else:
-            questions = [q0]
+        questions = decompose_question(q0, max_parts=3) or [q0] if is_complex_question(q0) else [q0]
 
-    all_facts = []
-    all_seeds_meta = []
+    all_facts: List[str] = []
+    all_seeds_meta: List[dict] = []
+    answers: List[str] = []                       # collect answers ONCE (no second LLM call)
+    labels = body.labels or DEFAULT_LABELS        # compute once for params echo
 
     for q in questions:
         # 1) Embed question
         qvec = get_question_embedding(q)
 
         # 2) Hybrid candidates (vector + keyword)
-        labels = body.labels or DEFAULT_LABELS
         cands = hybrid_candidates(
             question=q, qvec=qvec, labels=labels,
             k_vec=max(12, body.top_k), k_kw=max(12, body.top_k),
@@ -109,32 +106,27 @@ def graphrag(body: RagBody = Body(...)):
         if body.use_cross_doc and len(cands) > 1:
             cands = diversify_by_document(cands, k=len(cands))
 
-        # 5) Expand neighbors
-        with driver.session() as s:
-            seed_ids = [n.element_id for n, _ in cands]
+        # 5) Expand neighbors (no need to open a session just to read element ids)
+        seed_ids = [n.element_id for n, _ in cands]
         expanded = traverse_neighbors(
             seed_ids,
             max_hops=max(1, min(body.hops, 3))
         )
 
         # 6) Format context & answer
-        facts = format_graph_context(expanded, max_lines=40)
+        facts = format_graph_context(expanded)
         ans = generate_llm_answer(q, facts)
+        answers.append(ans)
 
-        # collect
+        # collect for response
         all_facts.append(f"Q: {q}\n{facts}")
         all_seeds_meta.extend([
             {"labels": list(n.labels), "name": n.get("name") or n.get("title"), "score": sc}
             for n, sc in cands
         ])
 
-    final_answer = (
-        "\n\n".join(
-            f"{i+1}. {a}"
-            for i, a in enumerate([generate_llm_answer(q, f) for q, f in zip(questions, all_facts)])
-        )
-        if len(questions) > 1 else generate_llm_answer(questions[0], all_facts[0])
-    )
+    # Reuse the answers we already generated
+    final_answer = "\n\n".join(f"{i+1}. {a}" for i, a in enumerate(answers)) if len(answers) > 1 else answers[0]
 
     return {
         "answer": final_answer,
@@ -149,8 +141,6 @@ def graphrag(body: RagBody = Body(...)):
             "beta_kw": body.beta_kw,
             "use_mmr": body.use_mmr,
             "use_cross_doc": body.use_cross_doc,
-            "decompose": body.decompose if body.decompose is not None else "AUTO"
+            "decompose": body.decompose if body.decompose is not None else "AUTO",
         }
     }
-
-
