@@ -4,3 +4,6 @@ openai>=1.37.0
 tiktoken
 fastapi
 uvicorn[standard]
+celery[redis]
+redis
+python-multipart

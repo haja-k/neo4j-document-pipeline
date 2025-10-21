@@ -3,10 +3,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 # Install deps
 RUN pip install --no-cache-dir --upgrade pip
+
+# Install python-multipart explicitly
+RUN pip install --no-cache-dir python-multipart
 
 # Copy requirements first (better build caching)
 COPY requirements.txt /app/requirements.txt

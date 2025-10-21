@@ -1,8 +1,8 @@
-# main.py
-import re
+import re, os, uuid
 from typing import List, Optional
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from tasks import ingest_markdown_task
 from pydantic import BaseModel, Field
 
 from neo4j_connect import driver
@@ -19,6 +19,8 @@ from graphutil import (
 )
 
 app = FastAPI(title="GraphRAG API")
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -143,4 +145,25 @@ def graphrag(body: RagBody = Body(...)):
             "use_cross_doc": body.use_cross_doc,
             "decompose": body.decompose if body.decompose is not None else "AUTO",
         }
+    }
+
+@app.post("/ingest")
+async def upload_and_ingest(file: UploadFile):
+    file_id = str(uuid.uuid4())
+    save_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
+
+    with open(save_path, "wb") as f:
+        f.write(await file.read())
+
+    task = ingest_markdown_task.delay(save_path)
+    return {"job_id": task.id, "status": "queued"}
+
+@app.get("/ingest/status/{job_id}")
+def check_status(job_id: str):
+    from celery_app import celery
+    result = celery.AsyncResult(job_id)
+    return {
+        "job_id": job_id,
+        "state": result.state,
+        "result": result.result
     }
