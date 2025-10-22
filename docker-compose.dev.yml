@@ -1,0 +1,68 @@
+version: "3.9"
+
+services:
+  neo4j:
+    image: neo4j:5
+    container_name: neo4j-dev  # Suffix for dev to avoid conflicts
+    ports:
+      - "7474:7474"   # HTTP (Browser/API)
+      - "7687:7687"   # Bolt (drivers)
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD}"
+      NEO4J_PLUGINS: '["apoc","graph-data-science"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+    volumes:
+      - neo4j-data-dev:/data  # Suffix for dev volumes
+      - neo4j-logs-dev:/logs
+      - neo4j-plugins-dev:/plugins
+      - ./import:/import
+      - ./config:/config
+    networks:
+      - scspedia_network
+
+  api:
+    container_name: graphrag-api-dev  # Suffix for dev
+    image: neo4j-api:v0.1
+    environment:
+      NEO4J_URI: bolt://neo4j:7687  # Use service name for internal comms
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: "12345678"
+      DEBUG: true  # Enable debug mode (if your app supports it)
+    volumes:
+      - ./:/app  # Mount for hot-reloading in dev
+    depends_on:
+      - neo4j
+    ports:
+      - "8686:8686"
+    networks:
+      - scspedia_network
+    
+  redis:
+    image: redis:7
+    container_name: redis-dev  # Suffix for dev
+    ports:
+      - "6379:6379"
+    networks:
+      - scspedia_network
+
+  celery_worker:
+    build: .
+    command: celery -A celery_app.celery worker --loglevel=info --concurrency=1  # Limit concurrency for dev
+    depends_on:
+      - redis
+    volumes:
+      - .:/app  # Mount for hot-reloading in dev
+    networks:
+      - scspedia_network
+
+volumes:
+  neo4j-data-dev:
+  neo4j-logs-dev:
+  neo4j-plugins-dev:
+
+networks:
+  scspedia_network:
+    name: scspedia_network_dev  # Suffix for dev to avoid conflicts

@@ -1,0 +1,9 @@
+api_key: 
+azure_configs:
+  base_url: 
+  embedding_deployment: 
+  api_version: 
+  chat_deployment: 
+
+chunking:
+  size: 2500     
