@@ -263,19 +263,67 @@ def _query_label_index(session, label: str, top_k: int, qvec: List[float]) -> Li
     )
     return [(r["node"], float(r["score"])) for r in res]
 
+
+def get_labels_with_embeddings() -> List[str]:
+    """Return only labels that actually have nodes with embeddings"""
+    with driver.session() as s:
+        result = s.run("""
+        CALL db.labels() YIELD label
+        MATCH (n:label) 
+        WHERE n.embedding IS NOT NULL
+        RETURN label, count(n) as count 
+        ORDER BY count DESC
+        """)
+        return [record["label"] for record in result if record["count"] > 0]
+
+def get_labels_with_embeddings() -> List[str]:
+    """Return only labels that actually have nodes with embeddings"""
+    with driver.session() as s:
+        result = s.run("""
+        CALL db.labels() YIELD label
+        MATCH (n:label) 
+        WHERE n.embedding IS NOT NULL
+        RETURN label, count(n) as count 
+        ORDER BY count DESC
+        """)
+        return [record["label"] for record in result if record["count"] > 0]
+
 def vector_find_similar_nodes(qvec: List[float], labels: Iterable[str], top_k: int = 12) -> List[Tuple[Any, float]]:
-    """Query across multiple label indexes and merge deduped results."""
+    """Smart vector search that only queries labels with actual data"""
     labels = list(labels) if labels else DEFAULT_LABELS
-    results: Dict[str, Tuple[Any, float]] = {}
+    
+    # Filter to only labels that have nodes with embeddings
+    valid_labels = []
     with driver.session() as s:
         for label in labels:
+            try:
+                # Quick check if label has any nodes with embeddings
+                result = s.run(
+                    f"MATCH (n:{label}) WHERE n.embedding IS NOT NULL RETURN count(n) as count LIMIT 1"
+                ).single()
+                if result and result["count"] > 0:
+                    valid_labels.append(label)
+                else:
+                    print(f"[vector] skipping {label}: no nodes with embeddings")
+            except Exception as e:
+                print(f"[vector] label check failed for {label}: {e}")
+    
+    if not valid_labels:
+        print("[vector] No valid labels found with embeddings")
+        return []
+    
+    results: Dict[str, Tuple[Any, float]] = {}
+    with driver.session() as s:
+        for label in valid_labels:
             try:
                 for node, score in _query_label_index(s, label, top_k, qvec):
                     eid = node.element_id
                     if eid not in results or score > results[eid][1]:
                         results[eid] = (node, score)
             except Exception as e:
-                print(f"[vector] skip {label}: {e}")
+                print(f"[vector] search failed for {label}: {e}")
+                # Continue with other labels instead of failing completely
+    
     merged = sorted(results.values(), key=lambda t: t[1], reverse=True)
     return merged[:top_k]
 
@@ -440,6 +488,9 @@ def traverse_neighbors(seed_element_ids: List[str],
     Expand neighborhood around seeds. Uses APOC if present; otherwise pure Cypher.
     Neo4j 5 compatible. (min_confidence kept for API compatibility but unused)
     """
+    if not seed_element_ids:
+        return {"nodes": [], "rels": []}
+        
     with driver.session() as s:
         try:
             apoc_ok = s.run("""
@@ -479,6 +530,9 @@ def traverse_neighbors(seed_element_ids: List[str],
               }] AS rels
             """
             rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
+            # FIX: Handle case where rec is None
+            if rec is None:
+                return {"nodes": [], "rels": []}
             return {"nodes": rec["nodes"], "rels": rec["rels"]}
 
         # ---------- Pure Cypher fallback (no APOC at all) ----------
@@ -505,6 +559,9 @@ def traverse_neighbors(seed_element_ids: List[str],
           }] AS rels
         """
         rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
+        # FIX: Handle case where rec is None
+        if rec is None:
+            return {"nodes": [], "rels": []}
         return {"nodes": rec["nodes"], "rels": rec["rels"]}
 
 def format_graph_context(expanded: dict, max_lines: int = 40) -> str:
@@ -514,12 +571,15 @@ def format_graph_context(expanded: dict, max_lines: int = 40) -> str:
     - No confidence sorting or display.
     - Limits total lines via max_lines.
     """
-    if not expanded:
+    if not expanded or not expanded.get("nodes"):
         return "Graph Facts: (no results)"
 
     nodes = {n.get("id"): n for n in expanded.get("nodes", [])}
     rels = expanded.get("rels", []) or []
     rels = [r for r in rels if r.get("type") not in {"SOURCE", "MENTIONS"}]
+
+    if not rels:
+        return "Graph Facts: (no relationships found)"
 
     lines = ["Graph Facts:"]
     for r in rels[:max_lines]:

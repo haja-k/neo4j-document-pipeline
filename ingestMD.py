@@ -381,30 +381,74 @@ def create_doc_constraints():
         FOR (d:Document) REQUIRE d.doc_id IS UNIQUE
         """)
 
-# --------------------------
-# Vector + name indexes (once)
-# --------------------------
-def create_vector_indexes(dim: int = 3072):
+def detect_embedding_dimensions() -> int:
+    """Detect the actual embedding dimensions from Azure OpenAI"""
+    try:
+        test_text = "test embedding dimensions"
+        response = client.embeddings.create(input=[test_text], model=EMBED_MODEL)
+        dimensions = len(response.data[0].embedding)
+        print(f"🔍 Detected embedding dimensions: {dimensions}")
+        return dimensions
+    except Exception as e:
+        print(f"❌ Could not detect embedding dimensions: {e}")
+        return 1536  # Safe fallback
+
+def create_vector_indexes():
+    """Create vector indexes with correct dimensions - DROP AND RECREATE"""
+    dimensions = detect_embedding_dimensions()
+    
     labels = [
         "Document", "Stakeholder", "Goal", "Challenge", "Outcome", "Policy",
         "Strategy", "Pillar", "Sector", "Time_Period", "Infrastructure",
         "Technology", "Initiative", "Objective", "Target", "Opportunity",
         "Vision", "Region", "Enabler", "Entity",
     ]
+    
     with driver.session() as session:
+        # First, drop ALL existing vector indexes to avoid conflicts
+        print("🗑️  Dropping existing vector indexes...")
         for label in labels:
             index_name = f"{label}_embedding_index"
-            print(f"🧠 Creating vector index: {index_name}")
-            session.run(f"""
-            CREATE VECTOR INDEX {index_name} IF NOT EXISTS
-            FOR (n:{label}) ON (n.embedding)
-            OPTIONS {{
-              indexConfig: {{
-                `vector.dimensions`: {dim},
-                `vector.similarity_function`: 'cosine'
-              }}
-            }}
+            try:
+                session.run(f"DROP INDEX {index_name} IF EXISTS")
+            except Exception as e:
+                print(f"⚠️  Could not drop {index_name}: {e}")
+        
+        # Then create all indexes with correct dimensions
+        print("🧠 Creating new vector indexes...")
+        for label in labels:
+            index_name = f"{label}_embedding_index"
+            try:
+                session.run(f"""
+                CREATE VECTOR INDEX {index_name}
+                FOR (n:{label}) ON (n.embedding)
+                OPTIONS {{
+                  indexConfig: {{
+                    `vector.dimensions`: {dimensions},
+                    `vector.similarity_function`: 'cosine'
+                  }}
+                }}
+                """)
+                print(f"✅ Created vector index: {index_name} ({dimensions}D)")
+            except Exception as e:
+                print(f"❌ Failed to create vector index {index_name}: {e}")
+
+def create_fulltext_index():
+    """Create proper fulltext index"""
+    with driver.session() as session:
+        try:
+            # Drop existing fulltext index
+            session.run("DROP INDEX node_text_fulltext IF EXISTS")
+            
+            # Create new fulltext index with correct labels
+            session.run("""
+            CREATE FULLTEXT INDEX node_text_fulltext
+            FOR (n:Document|Stakeholder|Goal|Challenge|Outcome|Pillar|Entity|Policy|Strategy|Sector) 
+            ON EACH [n.name, n.title]
             """)
+            print("✅ Created fulltext index: node_text_fulltext")
+        except Exception as e:
+            print(f"❌ Failed to create fulltext index: {e}")
 
 def create_name_indexes():
     """Optional but recommended: speed up MERGE by (name)."""
@@ -477,6 +521,16 @@ def process_file(path: str, in_memory_chunk_cache: Dict[str, List[Dict[str, Any]
 
 if __name__ == "__main__":
     assert_azure_deployments()
+    
+    # CREATE INDEXES FIRST
+    print("🔧 Creating indexes...")
+    create_doc_constraints()
+    create_name_indexes()
+    create_vector_indexes(dim=1536)  # Explicitly set to 1536
+    create_fulltext_index()
+    print("✅ All indexes created/verified")
+    
+    # Then process files
     files = discover_markdown(recursive=False)
     if not files:
         print(f"⚠️  No Markdown files found under {Path.cwd()}")
@@ -486,10 +540,7 @@ if __name__ == "__main__":
     for fp in files:
         process_file(fp, in_memory_chunk_cache=chunk_cache)
 
-    create_name_indexes()
-    create_doc_constraints()
-    create_vector_indexes()
-    print("\n✅ Ingestion and indexing complete.")
+    print("\n✅ Ingestion complete.")
 
 
 # python ingestMD.py
