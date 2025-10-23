@@ -6,6 +6,7 @@
 1. Build the docker image by running the file **build_images.sh**
 2. Run the file named **run_dev.sh** 
 3. Observe the logs from the terminal and fix/update the API accordingly
+4. Access the Swagger UI to see the API list at **http://127.0.0.1:8086/docs**
 
 ### ➡️ In TNT environment (Server deployment):
 1. Build the docker image by running the file **build_images.sh**
