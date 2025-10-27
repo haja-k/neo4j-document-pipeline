@@ -1,9 +1,15 @@
-api_key: 
+api_key: ""
 azure_configs:
-  base_url: 
-  embedding_deployment: 
-  api_version: 
-  chat_deployment: 
+  base_url: ""
+  embedding_deployment: ""
+  api_version: ""
+  chat_deployment: ""
 
 chunking:
-  size: 2500     
+  size: 2500
+
+embedding_provider: "sains_vllm"      
+sains_vllm:
+  base_url: ""
+  model: ""
+  api_key: ""
