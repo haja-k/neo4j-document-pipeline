@@ -705,3 +705,4 @@ def format_graph_context(
         )
 
     return "\n".join(lines)
+
