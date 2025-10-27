@@ -1,24 +1,21 @@
 import time
 import re, os, uuid
 from typing import List, Optional
-from fastapi import FastAPI, Body, UploadFile
+from fastapi import FastAPI, Body, UploadFile, Request
 from neo4j.exceptions import ServiceUnavailable
 from fastapi.middleware.cors import CORSMiddleware
 from tasks import ingest_markdown_task
 from pydantic import BaseModel, Field
-
+from time import perf_counter
 from neo4j_connect import driver
 from graphutil import (
+    init_clients,
     get_question_embedding,
     hybrid_candidates,
     mmr_select,
-    fulltext_search,
     diversify_by_document,
-    vector_find_similar_nodes,
     traverse_neighbors,
     format_graph_context,
-    generate_llm_answer,
-    decompose_question,
     DEFAULT_LABELS, 
     driver
 )
@@ -33,29 +30,20 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# ---------- Heuristic for AUTO decomposition ----------
-def is_complex_question(q: str) -> bool:
-    text = (q or "").strip()
-    if not text:
-        return False
-    qm = text.count("?") >= 2
-    long_and_conj = (len(text.split()) >= 18) and bool(re.search(r"\b(and|or)\b", text, flags=re.I))
-    many_commas = text.count(",") + text.count(";") >= 2
-    enumerations = bool(re.search(r"(?:^|\s)(\d+\.)\s", text))
-    return qm or long_and_conj or many_commas or enumerations
+# NEW: ensure embedding/chat clients are initialized at app startup
+@app.on_event("startup")
+async def _startup():
+    await init_clients()  # if your init is sync, change to: init_clients()
 
-# ---------- Request schema ----------
 class RagBody(BaseModel):
     question: str = Field(..., description="User question")
-    top_k: int = 7
+    top_k: int = 10
     hops: int = 1
     labels: Optional[List[str]] = None
-    use_hybrid: bool = True
     alpha_vec: float = 0.6
-    beta_kw: float = 0.25
+    beta_kw: float = 0.4
     use_mmr: bool = True
     use_cross_doc: bool = True
-    decompose: Optional[bool] = False
 
 @app.get("/test")
 def test():
@@ -131,101 +119,87 @@ def verify_embedding_system():
             break
 
 @app.post("/graphrag")
-def graphrag(body: RagBody = Body(...)):
+async def graphrag(body: RagBody = Body(...), request: Request = None):  # async + Request
     if not body.question.strip():
         return {"answer": "Please provide a question.", "facts": "", "seeds": []}
 
+    timings = {}
+    t_total = perf_counter()
+
     q0 = body.question.strip()
+    labels = body.labels or DEFAULT_LABELS
 
-    # NOTE: Debugging
-    print(f"Processing question: {q0}")
+    # 1) Embed question (AWAIT)
+    t = perf_counter()
+    qvec = await get_question_embedding(q0, request=request)
+    timings["embed"] = perf_counter() - t
 
-    # Decomposition: AUTO when decompose is None; else honor True/False
-    if body.decompose is True:
-        questions = decompose_question(q0, max_parts=3) or [q0]
-    elif body.decompose is False:
-        questions = [q0]
+    # 2) Hybrid candidates (vector + keyword)
+    t = perf_counter()
+    cands = hybrid_candidates(
+        question=q0, qvec=qvec, labels=labels,
+        k_vec=max(12, body.top_k), k_kw=max(12, body.top_k),
+        alpha_vec=body.alpha_vec, beta_kw=body.beta_kw
+    )
+    timings["hybrid"] = perf_counter() - t
+
+    # 3) MMR diversification
+    if body.use_mmr and len(cands) > body.top_k:
+        t = perf_counter()
+        cands = mmr_select(cands, k=body.top_k)
+        timings["mmr"] = perf_counter() - t
     else:
-        questions = decompose_question(q0, max_parts=3) or [q0] if is_complex_question(q0) else [q0]
+        cands = cands[:body.top_k]
 
-    all_facts: List[str] = []
-    all_seeds_meta: List[dict] = []
-    answers: List[str] = []                       # collect answers ONCE (no second LLM call)
-    labels = body.labels or DEFAULT_LABELS        # compute once for params echo
+    # 4) Cross-document coverage
+    if body.use_cross_doc and len(cands) > 1:
+        t = perf_counter()
+        cands = diversify_by_document(cands, k=len(cands))
+        timings["cross_doc"] = perf_counter() - t
 
-    for q in questions:
-        # 1) Embed question
-        qvec = get_question_embedding(q)
-        
-        # NOTE: Debugging
-        print(f"Got embedding for: {q}") 
+    # 5) Expand neighbors
+    t = perf_counter()
+    seed_ids = [n.element_id for n, _ in cands]
+    expanded = traverse_neighbors(
+        seed_ids,
+        max_hops=max(1, min(body.hops, 3))
+    )
+    timings["graph_traverse"] = perf_counter() - t
 
-        # 2) Hybrid candidates (vector + keyword)
-        cands = hybrid_candidates(
-            question=q, qvec=qvec, labels=labels,
-            k_vec=max(12, body.top_k), k_kw=max(12, body.top_k),
-            alpha_vec=body.alpha_vec, beta_kw=body.beta_kw
-        )
+    # 6) Format context (final step now)
+    t = perf_counter()
+    facts = format_graph_context(expanded, max_lines=None, snippet_chars=None, include_source=True)
+    timings["format_context"] = perf_counter() - t
+    
+    # No LLM step — return the context as the "answer"
+    ans = facts
 
-        # NOTE: Debugging
-        print(f"Found {len(cands)} candidates")
+    # seeds meta
+    seeds_meta = [
+        {"labels": list(n.labels), "name": n.get("name") or n.get("title"), "score": sc}
+        for n, sc in cands
+    ]
 
-        # 3) MMR diversification
-        if body.use_mmr and len(cands) > body.top_k:
-            cands = mmr_select(cands, k=body.top_k)
-        else:
-            cands = cands[:body.top_k]
-
-        # 4) Cross-document coverage
-        if body.use_cross_doc and len(cands) > 1:
-            cands = diversify_by_document(cands, k=len(cands))
-
-        # 5) Expand neighbors - with error handling
-        seed_ids = [n.element_id for n, _ in cands]
-        print(f"Expanding {len(seed_ids)} seeds with {body.hops} hops")
-        
-        try:
-            expanded = traverse_neighbors(
-                seed_ids,
-                max_hops=max(1, min(body.hops, 3))
-            )
-            print(f"Expanded graph: {len(expanded.get('nodes', []))} nodes, {len(expanded.get('rels', []))} relationships")
-        except Exception as e:
-            print(f"Error in traverse_neighbors: {e}")
-            expanded = {"nodes": [], "rels": []}
-
-        # 6) Format context & answer
-        facts = format_graph_context(expanded)
-        ans = generate_llm_answer(q, facts)
-        answers.append(ans)
-
-        # collect for response
-        all_facts.append(f"Q: {q}\n{facts}")
-        all_seeds_meta.extend([
-            {"labels": list(n.labels), "name": n.get("name") or n.get("title"), "score": sc}
-            for n, sc in cands
-        ])
-
-    # Reuse the answers we already generated
-    final_answer = "\n\n".join(f"{i+1}. {a}" for i, a in enumerate(answers)) if len(answers) > 1 else answers[0]
+    timings["total"] = perf_counter() - t_total
+    print(f"[TIMINGS] {timings}")
 
     return {
-        "answer": final_answer,
-        "facts": "\n\n---\n\n".join(all_facts),
-        "seeds": all_seeds_meta,
+        "answer": ans,
+        "facts": f"Q: {q0}\n{facts}",
+        "seeds": seeds_meta,
         "params": {
             "top_k": body.top_k,
             "hops": body.hops,
             "labels": labels,
-            "use_hybrid": body.use_hybrid,
             "alpha_vec": body.alpha_vec,
             "beta_kw": body.beta_kw,
             "use_mmr": body.use_mmr,
             "use_cross_doc": body.use_cross_doc,
-            "decompose": body.decompose if body.decompose is not None else "AUTO",
-        }
+            "used_llm": False,
+        },
+        "timings": timings,
     }
-
+    
 @app.post("/debug-search")
 def debug_search(body: dict = Body(...)):
     """Debug endpoint to test search components separately"""
@@ -235,11 +209,7 @@ def debug_search(body: dict = Body(...)):
         
         # Test vector search
         qvec = get_question_embedding(question)
-        vector_results = vector_find_similar_nodes(qvec, DEFAULT_LABELS, top_k=5)
-        
-        # Test keyword search  
-        keyword_results = fulltext_search(question, limit=5, labels=DEFAULT_LABELS)
-        
+
         # Test hybrid
         hybrid_results = hybrid_candidates(question, qvec, DEFAULT_LABELS, k_vec=5, k_kw=5)
         
@@ -269,8 +239,6 @@ def debug_search(body: dict = Body(...)):
             "existing_labels": existing_labels,
             "existing_indexes": existing_indexes,
             "label_counts": label_counts,
-            "vector_results_count": len(vector_results),
-            "keyword_results_count": len(keyword_results),
             "hybrid_results_count": len(hybrid_results),
             "default_labels": DEFAULT_LABELS,
             "status": "success"

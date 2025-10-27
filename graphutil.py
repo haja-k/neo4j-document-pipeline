@@ -1,39 +1,137 @@
 # graphutil.py
+import os
 import math
 import re
 import yaml
+import httpx
+import asyncio
+import time
 from typing import List, Dict, Any, Iterable, Tuple, Optional
 from neo4j_connect import driver
 from openai import AzureOpenAI
 
-# --- Load config shared with ingest ---
-with open("config/embedConfig.yaml", "r") as f:
-    _cfg = yaml.safe_load(f)
+# ===============================
+# Persistent Clients & Config
+# ===============================
+_cfg = None
+_openai = None
+client = None
+_vllm_http: Optional[httpx.AsyncClient] = None
+CHAT_MODEL = None
 
-_openai = _cfg["azure_configs"]
-EMBED_MODEL = _openai["embedding_deployment"]
-CHAT_MODEL  = _openai["chat_deployment"]
+async def init_clients():
+    """Initialize persistent clients once."""
+    global _cfg, _openai, client, _vllm_http, CHAT_MODEL
 
-client = AzureOpenAI(
-    api_key=_cfg["api_key"],
-    api_version=_openai["api_version"],
-    azure_endpoint=_openai["base_url"]
-)
+    if _cfg is None:
+        with open("config/embedConfig.yaml", "r") as f:
+            _cfg = yaml.safe_load(f)
+        _openai = _cfg["azure_configs"]
 
+    if client is None:
+        client = AzureOpenAI(
+            api_key=_cfg["api_key"],
+            api_version=_openai["api_version"],
+            azure_endpoint=_openai["base_url"]
+        )
+
+    if _vllm_http is None:
+        api_key = os.getenv("SAINS_VLLM_API_KEY", _cfg.get("sains_vllm", {}).get("api_key", ""))
+        _vllm_http = httpx.AsyncClient(
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            timeout=10.0
+        )
+
+    CHAT_MODEL = _openai["chat_deployment"]
+    return _cfg, client, _vllm_http
+
+
+async def close_clients(vllm_http):
+    try:
+        await vllm_http.aclose()
+    except Exception:
+        pass
+
+
+# ===============================
+# Provider Config
+# ===============================
+def _lazy_cfg():
+    global _cfg, _openai
+    if _cfg is None:
+        with open("config/embedConfig.yaml", "r") as f:
+            _cfg = yaml.safe_load(f)
+        _openai = _cfg["azure_configs"]
+    return _cfg, _openai
+
+
+def _get_providers():
+    _cfg, _openai = _lazy_cfg()
+    provider = os.getenv("EMBEDDING_PROVIDER", _cfg.get("embedding_provider", "azure")).lower()
+    return provider, _cfg, _openai
+
+
+# ===============================
+# Embedding Functions
+# ===============================
+def _azure_embed(text: str) -> List[float]:
+    """Sync embedding call to Azure OpenAI."""
+    print("[DEBUG] >>> Using Azure sync embedding path")
+    resp = client.embeddings.create(input=[text], model=_openai["embedding_deployment"])
+    return resp.data[0].embedding
+
+
+async def _sains_vllm_embed(text: str, request=None) -> List[float]:
+    """Async embedding call to vLLM server (diagnostic timing)."""
+    print("[DEBUG] >>> Using vLLM async embedding path")
+    _, _cfg, _ = _get_providers()
+    sains_cfg = _cfg.get("sains_vllm", {})
+    base_url = sains_cfg.get("base_url", "").rstrip("/")
+    model = sains_cfg.get("model", "Qwen/Qwen3-Embedding-8B")
+
+    session = request.app.state.vllm_http if request and hasattr(request.app.state, "vllm_http") else _vllm_http
+
+    payload = {"model": model, "input": [text]}
+
+    t0 = time.perf_counter()
+    resp = await session.post(f"{base_url}/embeddings", json=payload)
+    elapsed = time.perf_counter() - t0
+    print(f"[DEBUG] Embedding HTTP call took {elapsed:.3f}s, status={resp.status_code}")
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+
+async def get_question_embedding(question: str, request=None) -> List[float]:
+    """Return embedding, async for vLLM."""
+    provider, *_ = _get_providers()
+    print(provider)
+    if provider == "sains_vllm":
+        print("Hi")
+        return await _sains_vllm_embed(question, request=request)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _azure_embed, question)
+
+
+# ===============================
+# Shared Constants
+# ===============================
 DEFAULT_LABELS = [
-    "Stakeholder","Goal","Challenge","Outcome","Policy","Strategy","Pillar","Sector",
-    "Time_Period","Infrastructure","Technology","Initiative","Objective","Target",
-    "Opportunity","Vision","Region","Enabler","Entity"
+    "Stakeholder", "Goal", "Challenge", "Outcome", "Policy", "Strategy", "Pillar", "Sector",
+    "Time_Period", "Infrastructure", "Technology", "Initiative", "Objective", "Target",
+    "Opportunity", "Vision", "Region", "Enabler", "Entity"
 ]
 
-# =========================
-# Embeddings & utilities
-# =========================
-def get_question_embedding(question: str) -> List[float]:
-    """Embed a user question for vector search."""
-    emb = client.embeddings.create(input=[question], model=EMBED_MODEL)
-    return emb.data[0].embedding
 
+# This variable is initialized by init_clients()
+CHAT_MODEL = None
+
+
+# ===============================
+# Utility functions
+# ===============================
 def _cosine(a: List[float], b: List[float]) -> float:
     num = 0.0
     da = 0.0
@@ -45,6 +143,7 @@ def _cosine(a: List[float], b: List[float]) -> float:
     if da == 0.0 or db == 0.0:
         return 0.0
     return num / (math.sqrt(da) * math.sqrt(db))
+
 
 def _minmax_norm(values: List[float]) -> List[float]:
     if not values:
@@ -215,38 +314,6 @@ def fulltext_search(question: str, limit: int = 12, labels: Optional[List[str]] 
 
         return hits[:limit]
 
-def build_retrieval_query(question: str, max_len: int = 240) -> str:
-    """
-    Produce a compact, anchor-first retrieval string that fits the tool's 256-char limit.
-    Keeps quoted phrases / Title-Cased bigrams, then top keywords, trimmed to max_len.
-    """
-    anchors = _anchor_terms(question, max_terms=3)
-    kws     = _extract_keywords(question, max_terms=8)
-
-    terms, seen = [], set()
-    for t in anchors + kws:
-        t = (t or "").strip()
-        if not t:
-            continue
-        low = t.lower()
-        if low in seen:
-            continue
-        seen.add(low)
-        terms.append(f'"{t}"' if " " in t else t)
-
-    out, total = [], 0
-    for t in terms:
-        add = (t + " ")
-        if total + len(add) > max_len:
-            break
-        out.append(t)
-        total += len(add)
-
-    q = " ".join(out).strip()
-    if not q:
-        q = question[:max_len]
-    return q
-
 # =========================
 # Vector search (base)
 # =========================
@@ -263,67 +330,19 @@ def _query_label_index(session, label: str, top_k: int, qvec: List[float]) -> Li
     )
     return [(r["node"], float(r["score"])) for r in res]
 
-
-def get_labels_with_embeddings() -> List[str]:
-    """Return only labels that actually have nodes with embeddings"""
-    with driver.session() as s:
-        result = s.run("""
-        CALL db.labels() YIELD label
-        MATCH (n:label) 
-        WHERE n.embedding IS NOT NULL
-        RETURN label, count(n) as count 
-        ORDER BY count DESC
-        """)
-        return [record["label"] for record in result if record["count"] > 0]
-
-def get_labels_with_embeddings() -> List[str]:
-    """Return only labels that actually have nodes with embeddings"""
-    with driver.session() as s:
-        result = s.run("""
-        CALL db.labels() YIELD label
-        MATCH (n:label) 
-        WHERE n.embedding IS NOT NULL
-        RETURN label, count(n) as count 
-        ORDER BY count DESC
-        """)
-        return [record["label"] for record in result if record["count"] > 0]
-
 def vector_find_similar_nodes(qvec: List[float], labels: Iterable[str], top_k: int = 12) -> List[Tuple[Any, float]]:
-    """Smart vector search that only queries labels with actual data"""
+    """Query across multiple label indexes and merge deduped results."""
     labels = list(labels) if labels else DEFAULT_LABELS
-    
-    # Filter to only labels that have nodes with embeddings
-    valid_labels = []
-    with driver.session() as s:
-        for label in labels:
-            try:
-                # Quick check if label has any nodes with embeddings
-                result = s.run(
-                    f"MATCH (n:{label}) WHERE n.embedding IS NOT NULL RETURN count(n) as count LIMIT 1"
-                ).single()
-                if result and result["count"] > 0:
-                    valid_labels.append(label)
-                else:
-                    print(f"[vector] skipping {label}: no nodes with embeddings")
-            except Exception as e:
-                print(f"[vector] label check failed for {label}: {e}")
-    
-    if not valid_labels:
-        print("[vector] No valid labels found with embeddings")
-        return []
-    
     results: Dict[str, Tuple[Any, float]] = {}
     with driver.session() as s:
-        for label in valid_labels:
+        for label in labels:
             try:
                 for node, score in _query_label_index(s, label, top_k, qvec):
                     eid = node.element_id
                     if eid not in results or score > results[eid][1]:
                         results[eid] = (node, score)
             except Exception as e:
-                print(f"[vector] search failed for {label}: {e}")
-                # Continue with other labels instead of failing completely
-    
+                print(f"[vector] skip {label}: {e}")
     merged = sorted(results.values(), key=lambda t: t[1], reverse=True)
     return merged[:top_k]
 
@@ -482,15 +501,11 @@ def diversify_by_document(cands: List[Tuple[Any, float]], k: int) -> List[Tuple[
 # Expansion, formatting, answering
 # =========================
 def traverse_neighbors(seed_element_ids: List[str],
-                       max_hops: int = 1,
-                       min_confidence: float = 0.0) -> Dict[str, Any]:
+                       max_hops: int = 1) -> Dict[str, Any]:
     """
     Expand neighborhood around seeds. Uses APOC if present; otherwise pure Cypher.
-    Neo4j 5 compatible. (min_confidence kept for API compatibility but unused)
+    Neo4j 5 compatible.
     """
-    if not seed_element_ids:
-        return {"nodes": [], "rels": []}
-        
     with driver.session() as s:
         try:
             apoc_ok = s.run("""
@@ -530,9 +545,6 @@ def traverse_neighbors(seed_element_ids: List[str],
               }] AS rels
             """
             rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
-            # FIX: Handle case where rec is None
-            if rec is None:
-                return {"nodes": [], "rels": []}
             return {"nodes": rec["nodes"], "rels": rec["rels"]}
 
         # ---------- Pure Cypher fallback (no APOC at all) ----------
@@ -559,32 +571,108 @@ def traverse_neighbors(seed_element_ids: List[str],
           }] AS rels
         """
         rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
-        # FIX: Handle case where rec is None
-        if rec is None:
-            return {"nodes": [], "rels": []}
         return {"nodes": rec["nodes"], "rels": rec["rels"]}
 
-def format_graph_context(expanded: dict, max_lines: int = 40) -> str:
+# --------- Dedup helpers ---------
+_NUM_WORDS = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"
+}
+
+def _normalize_name_for_key(name: str) -> str:
     """
-    Turn the expanded subgraph into a compact, LLM-friendly text context.
-    - Skips noisy SOURCE and MENTIONS edges.
-    - No confidence sorting or display.
-    - Limits total lines via max_lines.
+    Normalize node names for dedup keys:
+    - lowercase
+    - strip punctuation
+    - collapse spaces
+    - map small number words -> digits (e.g., 'six' -> '6')
     """
-    if not expanded or not expanded.get("nodes"):
+    s = (name or "").lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = " ".join(_NUM_WORDS.get(tok, tok) for tok in s.split())
+    return s
+
+def _dedup_rels_by_key(rels: List[Dict[str, Any]], nodes_by_id: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Drop duplicate relations where (start_name, type, end_name) match after normalization.
+    Keeps the first occurrence (preserving its original props/snippet).
+    """
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for r in rels:
+        s = nodes_by_id.get(r.get("start"), {}) or {}
+        t = nodes_by_id.get(r.get("end"), {}) or {}
+        s_props = (s.get("props") or {})
+        t_props = (t.get("props") or {})
+        s_name = s_props.get("name") or s_props.get("title") or ""
+        t_name = t_props.get("name") or t_props.get("title") or ""
+        rtype  = (r.get("type") or "").lower()
+
+        key = (_normalize_name_for_key(s_name), rtype, _normalize_name_for_key(t_name))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+def _doc_titles_for_nodes(element_ids: List[str]) -> Dict[str, Optional[str]]:
+    """
+    Return {elementId(node) -> document title or None}.
+    Looks for either (node)-[:SOURCE]->(d:Document) or (d:Document)-[:MENTIONS]->(node).
+    Batched for speed.
+    """
+    if not element_ids:
+        return {}
+    ids = list({i for i in element_ids if i})  # unique, non-empty
+    with driver.session() as s:
+        recs = s.run("""
+        UNWIND $ids AS id
+        MATCH (n) WHERE elementId(n) = id
+        OPTIONAL MATCH (n)-[:SOURCE]->(d1:Document)
+        OPTIONAL MATCH (d2:Document)-[:MENTIONS]->(n)
+        RETURN id, coalesce(d1.title, d2.title) AS title
+        """, ids=ids)
+        out: Dict[str, Optional[str]] = {}
+        for r in recs:
+            out[r["id"]] = r["title"]
+        return out
+
+def format_graph_context(
+    expanded: dict,
+    max_lines: int | None = None,
+    snippet_chars: int | None = None,
+    include_source: bool = False,  # <--- NEW
+) -> str:
+    """
+    Build the 'Graph Facts' text.
+    - No clipping when `max_lines is None` and `snippet_chars is None`.
+    - Still skips noisy SOURCE/MENTIONS edges.
+    - When include_source=True, appends [source: "Document Title"] (or both if different).
+    """
+    if not expanded:
         return "Graph Facts: (no results)"
 
     nodes = {n.get("id"): n for n in expanded.get("nodes", [])}
     rels = expanded.get("rels", []) or []
     rels = [r for r in rels if r.get("type") not in {"SOURCE", "MENTIONS"}]
+    rels = _dedup_rels_by_key(rels, nodes)
 
-    if not rels:
-        return "Graph Facts: (no relationships found)"
+    # batch-fetch doc titles if requested
+    titles: Dict[str, Optional[str]] = {}
+    if include_source and rels:
+        id_pool: List[str] = []
+        for r in rels:
+            if r.get("start"): id_pool.append(r["start"])
+            if r.get("end"):   id_pool.append(r["end"])
+        titles = _doc_titles_for_nodes(id_pool)
+
+    # decide how many to show
+    rels_iter = rels[:max_lines] if isinstance(max_lines, int) and max_lines > 0 else rels
 
     lines = ["Graph Facts:"]
-    for r in rels[:max_lines]:
-        s = nodes.get(r.get("start"), {})
-        t = nodes.get(r.get("end"), {})
+    for r in rels_iter:
+        s = nodes.get(r.get("start"), {}) or {}
+        t = nodes.get(r.get("end"), {}) or {}
 
         s_props = s.get("props") or {}
         t_props = t.get("props") or {}
@@ -594,119 +682,26 @@ def format_graph_context(expanded: dict, max_lines: int = 40) -> str:
         t_label = (t.get("labels") or ["Entity"])[0]
 
         rprops = r.get("props") or {}
-        snip = (rprops.get("source_text") or "")[:200]
-        snip_str = f' [snippet: "{snip}..."]' if snip else ""
+        raw = (rprops.get("source_text_full") or rprops.get("source_text") or "").replace("\n", " ").strip()
+
+        # unlimited snippet unless a positive `snippet_chars` is provided
+        if isinstance(snippet_chars, int) and snippet_chars > 0 and len(raw) > snippet_chars:
+            snip = raw[:snippet_chars].rstrip() + "..."
+        else:
+            snip = raw
+
+        snip_str = f' [snippet: "{snip}"]' if snip else ""
+        src_str = ""
+        if include_source:
+            ts = titles.get(r.get("start"))
+            te = titles.get(r.get("end"))
+            if ts and te and ts != te:
+                src_str = f' [source: "{ts}" | "{te}"]'
+            elif ts or te:
+                src_str = f' [source: "{ts or te}"]'
 
         lines.append(
-            f'- {s_label}("{s_name}") -[{r.get("type")}]-> {t_label}("{t_name}"){snip_str}'
+            f'- {s_label}("{s_name}") -[{r.get("type")}]-> {t_label}("{t_name}"){snip_str}{src_str}'
         )
 
     return "\n".join(lines)
-
-def generate_llm_answer(
-    question: str,
-    facts: str,
-    max_tokens: int = 900,
-    style: str = "detailed",
-) -> str:
-    """
-    Answer ONLY from Graph Facts with maximal specificity:
-      1) First extract every numeric target (%, RM, counts, MW), dates/years,
-         and named projects/initiatives/entities that appear in the facts.
-      2) Present a 'Quantitative Highlights' list with those items (no omissions).
-      3) Then provide a structured narrative answer grouped by themes
-         (Economic / Social / Environmental / Infrastructure/Technology / Governance/Policy).
-      4) If something is missing in the facts, explicitly say: 'Not found in provided facts.'
-      5) Never invent or speculate beyond the facts.
-    """
-    if style not in {"detailed", "concise"}:
-        style = "detailed"
-
-    section_hint = (
-        "If the content spans multiple themes, group with these headers when relevant: "
-        "Economic, Social, Environmental, Infrastructure/Technology, Governance/Policy."
-    )
-
-    extraction_instructions = (
-        "Before drafting the answer, extract ALL quantitative items and proper nouns "
-        "(numbers with units like %, RM, MW, jobs, #startups; dates/years; named projects/initiatives; "
-        "named stakeholders and places) present in Graph Facts. "
-        "List them under 'Quantitative Highlights' as bullet points. "
-        "Do not include anything that is not explicitly present in the facts."
-    )
-
-    formatting_rules = (
-        "Formatting rules:\n"
-        "• Start with 'Quantitative Highlights' (every number/date/project found; no omissions).\n"
-        "• Then give a one-sentence executive summary.\n"
-        "• Then use short section headers and bullets (max ~12 bullets total unless asked for a long list).\n"
-        "• Prefer exact figures and named entities from the facts; do NOT estimate.\n"
-        "• If pillars/strategies are listed, include 1–2 concrete actions/initiatives under each IF present in facts.\n"
-        "• If info is missing, write: 'Not found in provided facts.'\n"
-        "• Do not cite or rely on outside knowledge.\n"
-    )
-
-    verbosity = (
-        "Be comprehensive but crisp. Keep to ~150–220 words."
-        if style == "concise"
-        else "Be detailed but crisp. Keep to ~220–320 words."
-    )
-
-    system = (
-        "You are a meticulous analyst. You must answer ONLY from the provided Graph Facts. "
-        "Your first duty is to extract every quantitative detail and named project found in the facts. "
-        "Never invent values beyond what is present. If missing, say so."
-    )
-
-    user = (
-        f"Question:\n{question}\n\n"
-        f"{section_hint}\n"
-        f"{extraction_instructions}\n"
-        f"{formatting_rules}\n"
-        f"{verbosity}\n\n"
-        f"Graph Facts (authoritative context):\n{facts}"
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            temperature=0.1,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=max_tokens,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"(Answer generation error: {e})"
-
-# =========================
-# Question decomposition
-# =========================
-def decompose_question(question: str, max_parts: int = 3) -> List[str]:
-    """
-    Use GPT to split complex questions into sub-questions (<= max_parts).
-    """
-    sys = (f"Split the user's question into up to {max_parts} minimal sub-questions, "
-           "ordered logically. Return ONLY a JSON array of strings.")
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {"role":"system","content":sys},
-            {"role":"user","content":question}
-        ],
-        temperature=0
-    )
-    txt = resp.choices[0].message.content.strip()
-    if txt.startswith("```"):
-        txt = txt.split("```", 1)[-1]
-    if txt.endswith("```"):
-        txt = txt[:-3]
-    import json
-    try:
-        arr = json.loads(txt)
-        out = [str(x).strip() for x in arr if str(x).strip()]
-        return out[:max_parts] if out else [question]
-    except Exception:
-        return [question]
