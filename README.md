@@ -20,4 +20,5 @@
 ## Note:
 - Running sh files in Linux and Windows have different methods respectively.
 - In Linux OS, make the file executable first by ```chmod +x <file name>```
+    - Then run ```sh <file name>```
 - In Windows terminal, just type in the name of the file
