@@ -722,7 +722,7 @@ def show_embedding_banner():
 # ----------------
 def process_file(path: str, in_memory_chunk_cache: Dict[str, List[Dict[str, Any]]]):
     abs_path = str(Path(path).resolve())
-    filename = Path(path).name
+    filename = Path(path).stem
 
     with open(path, "r", encoding="utf-8") as f:
         content_raw = f.read()

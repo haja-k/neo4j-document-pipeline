@@ -254,8 +254,9 @@ def debug_search(body: dict = Body(...)):
 @app.post("/ingest")
 async def upload_and_ingest(file: UploadFile):
     file_id = str(uuid.uuid4())
-    save_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
-
+    dir_path = os.path.join(UPLOAD_DIR, file_id)
+    os.makedirs(dir_path, exist_ok=True)
+    save_path = os.path.join(dir_path, file.filename)
     with open(save_path, "wb") as f:
         f.write(await file.read())
 
