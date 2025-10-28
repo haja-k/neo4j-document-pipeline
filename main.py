@@ -59,6 +59,45 @@ def healthz():
         return {"ok": True, "nodes": c}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+@app.post("/drop-all")
+def drop_all_nodes(confirmation: bool = Body(False)):
+    """Drop all nodes and relationships from the Neo4j database.
+    
+    Args:
+        confirmation (bool): Must be set to true to confirm deletion
+        
+    Returns:
+        dict: Status of the operation including node count before and after
+    """
+    if not confirmation:
+        return {
+            "status": "error",
+            "message": "Confirmation required. Set confirmation=true in request body to proceed with deletion."
+        }
+        
+    try:
+        with driver.session() as session:
+            # Get initial count
+            initial_count = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+            
+            # Delete all relationships and nodes
+            session.run("MATCH (n) DETACH DELETE n")
+            
+            # Verify deletion
+            final_count = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+            
+            return {
+                "status": "success",
+                "message": "Successfully cleared the database",
+                "nodes_before": initial_count,
+                "nodes_after": final_count
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to clear database: {str(e)}"
+        }
     
 @app.on_event("startup")
 def verify_embedding_system():
