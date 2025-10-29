@@ -302,8 +302,19 @@ async def upload_and_ingest(file: UploadFile):
     task = ingest_markdown_task.delay(save_path)
     return {"job_id": task.id, "status": "queued"}
 
-@app.get("/ingest/status/{job_id}")
-def check_status(job_id: str):
+@app.get("/ingest/status")
+def check_status(job_id: str = None):
+    """Check status of an ingest job
+    
+    Args:
+        job_id (str): The job ID from the ingest task
+    """
+    if not job_id:
+        return {
+            "status": "error",
+            "message": "job_id parameter is required"
+        }
+        
     from celery_app import celery
     result = celery.AsyncResult(job_id)
     return {
