@@ -390,7 +390,7 @@ def store_in_neo4j(
                         "s": s, "o": o_name,
                         "doc_id": doc_id, "doc_title": document_name, "doc_path": full_path,
                         "sub_emb": sub_emb, "obj_emb": obj_emb, "rel_emb": rel_emb,
-                        "src_txt": (source_text or "")[:1000],
+                        "src_txt": (source_text or ""),
                     })
                     continue
 
@@ -416,7 +416,7 @@ def store_in_neo4j(
                     "sub_emb": _emb_cache.get(sub_key),
                     "obj_emb": _emb_cache.get(obj_key),
                     "rel_emb": _emb_cache.get(rel_key),
-                    "src_txt": (source_text or "")[:1000],
+                    "src_txt": (source_text or ""),
                 })
                 continue
 
@@ -459,7 +459,7 @@ def store_in_neo4j(
                             "sub_emb": _emb_cache.get(sub_key),
                             "obj_emb": _emb_cache.get(obj_key),
                             "rel_emb": _emb_cache.get(rel_key),
-                            "src_txt": (source_text or "")[:1000],
+                            "src_txt": (source_text or ""),
                         })
                 continue
 
@@ -542,8 +542,7 @@ def store_in_neo4j(
 
             WITH rel, r.src_txt AS chunkTxt
             FOREACH (_ IN CASE WHEN chunkTxt IS NOT NULL AND size(chunkTxt) > 0 THEN [1] ELSE [] END |
-            SET rel.source_text       = substring(chunkTxt, 0, 1000),  // short preview
-                rel.source_text_full = chunkTxt                        // full text
+              SET rel.source_text_full = chunkTxt
             )
             RETURN count(*) AS wrote
             """
@@ -586,6 +585,10 @@ def store_in_neo4j(
             MERGE (d)-[:MENTIONS]->(tp)
             MERGE (sub)-[:SOURCE]->(d)
             MERGE (tp)-[:SOURCE]->(d)
+            WITH rel, r.src_txt AS chunkTxt
+            FOREACH (_ IN CASE WHEN chunkTxt IS NOT NULL AND size(chunkTxt) > 0 THEN [1] ELSE [] END |
+              SET rel.source_text_full = chunkTxt
+            )
             RETURN count(*) AS wrote
             """
             try:
@@ -627,6 +630,10 @@ def store_in_neo4j(
             MERGE (d)-[:MENTIONS]->(pl)
             MERGE (sub)-[:SOURCE]->(d)
             MERGE (pl)-[:SOURCE]->(d)
+            WITH rel, r.src_txt AS chunkTxt
+            FOREACH (_ IN CASE WHEN chunkTxt IS NOT NULL AND size(chunkTxt) > 0 THEN [1] ELSE [] END |
+              SET rel.source_text_full = chunkTxt
+            )
             RETURN count(*) AS wrote
             """
             try:
@@ -751,7 +758,7 @@ def process_file(path: str, in_memory_chunk_cache: Dict[str, List[Dict[str, Any]
                 document_name=filename,
                 doc_id=doc_id,
                 full_path=abs_path,
-                source_text=chunk[:1000],
+                source_text=chunk,
             )
             total_triples += len(triples)
         else:
@@ -764,11 +771,11 @@ def process_file(path: str, in_memory_chunk_cache: Dict[str, List[Dict[str, Any]
                     document_name=filename,
                     doc_id=doc_id,
                     full_path=abs_path,
-                    source_text=chunk[:1000],
+                    source_text=chunk,
                 )
                 total_triples += len(table_triples)
             else:
-                print("  …no triples extracted for this chunk")
+                print("…no triples extracted for this chunk")
 
     print(f"\n✅ Done: {filename} | Total triples: {total_triples}")
 
