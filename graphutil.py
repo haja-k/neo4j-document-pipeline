@@ -637,72 +637,125 @@ def _doc_titles_for_nodes(element_ids: List[str]) -> Dict[str, Optional[str]]:
             out[r["id"]] = r["title"]
         return out
 
+import hashlib
+import re
+
+def _canon_snippet_for_key(sn: str) -> str:
+    """Normalize snippet to make a stable grouping key."""
+    if not sn:
+        return ""
+    # squash whitespace, strip
+    s = re.sub(r"\s+", " ", sn).strip()
+    # use a short hash as the key to avoid huge dict keys
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 def format_graph_context(
     expanded: dict,
+    *,
     max_lines: int | None = None,
     snippet_chars: int | None = None,
-    include_source: bool = False,  # <--- NEW
+    include_source: bool = True,
+    group_by_chunk: bool = True,
+    max_snippets: = None, 
+    per_snippet_rel_limit: = None,  
 ) -> str:
     """
-    Build the 'Graph Facts' text.
-    - No clipping when `max_lines is None` and `snippet_chars is None`.
-    - Still skips noisy SOURCE/MENTIONS edges.
-    - When include_source=True, appends [source: "Document Title"] (or both if different).
+    Build a grouped 'Graph Facts' text.
+
+    - If group_by_chunk=True, we show ONE snippet per unique chunk (source_text_full),
+      then list all relations derived from that chunk under it.
+    - If snippet_chars is not None and >0, we show a preview of the snippet for display only.
+    - max_snippets caps how many unique chunks to render.
+    - per_snippet_rel_limit caps how many relations per chunk to print.
     """
     if not expanded:
         return "Graph Facts: (no results)"
 
-    nodes = {n.get("id"): n for n in expanded.get("nodes", [])}
-    rels = expanded.get("rels", []) or []
-    rels = [r for r in rels if r.get("type") not in {"SOURCE", "MENTIONS"}]
-    rels = _dedup_rels_by_key(rels, nodes)
+    nodes = {n.get("id"): n for n in (expanded.get("nodes") or [])}
+    rels  = [r for r in (expanded.get("rels") or [])
+             if (r.get("type") or "").upper() not in {"SOURCE", "MENTIONS"}]
 
-    # batch-fetch doc titles if requested
-    titles: Dict[str, Optional[str]] = {}
-    if include_source and rels:
-        id_pool: List[str] = []
+    # optional global cap (legacy behavior)
+    if isinstance(max_lines, int) and max_lines > 0 and len(rels) > max_lines:
+        rels = rels[:max_lines]
+
+    def _name(node_id):
+        n = nodes.get(node_id) or {}
+        return n.get("name") or n.get("id") or "(unknown)"
+
+    # choose the snippet text per relation
+    def _rel_snippet(rprops: dict) -> str:
+        raw = (rprops.get("source_text_full")
+               or rprops.get("source_text")
+               or "")
+        if isinstance(snippet_chars, int) and snippet_chars > 0 and len(raw) > snippet_chars:
+            return raw[:snippet_chars].rstrip() + "…"
+        return raw
+
+    # choose a label for the relation line
+    def _rel_line(r: dict) -> str:
+        s = _name(r.get("start"))
+        t = _name(r.get("end"))
+        reltype = r.get("type") or "RELATED_TO"
+        return f"- {s} -[{reltype.lower()}]-> {t}"
+
+    if not group_by_chunk:
+        # fallback: old flat style
+        lines = ["Graph Facts:"]
         for r in rels:
-            if r.get("start"): id_pool.append(r["start"])
-            if r.get("end"):   id_pool.append(r["end"])
-        titles = _doc_titles_for_nodes(id_pool)
+            rprops = r.get("props") or {}
+            snip = _rel_snippet(rprops)
+            src  = rprops.get("source") or rprops.get("doc_title") or ""
+            line = _rel_line(r)
+            if include_source and snip:
+                line += f" [snippet: {snip}]"
+            if include_source and src:
+                line += f" [source: {src}]"
+            lines.append(line)
+        return "\n".join(lines)
 
-    # decide how many to show
-    rels_iter = rels[:max_lines] if isinstance(max_lines, int) and max_lines > 0 else rels
+    # ---- grouped by chunk (unique snippet) ----
+    buckets = {}  # key -> {"snippet": "...", "doc": "...", "rels": [lines]}
+    order   = []  # preserve first-seen order of snippet keys
+
+    for r in rels:
+        rprops = r.get("props") or {}
+        full_snip = (rprops.get("source_text_full")
+                     or rprops.get("source_text")
+                     or "")
+        key = _canon_snippet_for_key(full_snip)
+        if key not in buckets:
+            # decide a display snippet (optional preview)
+            display_snip = _rel_snippet({"source_text_full": full_snip})
+            doc = (rprops.get("doc_title")
+                   or rprops.get("source")
+                   or rprops.get("doc_id")
+                   or "")
+            buckets[key] = {"snippet": display_snip, "doc": doc, "rels": []}
+            order.append(key)
+
+        buckets[key]["rels"].append(_rel_line(r))
+
+    # apply caps
+    if isinstance(max_snippets, int) and max_snippets > 0 and len(order) > max_snippets:
+        order = order[:max_snippets]
 
     lines = ["Graph Facts:"]
-    for r in rels_iter:
-        s = nodes.get(r.get("start"), {}) or {}
-        t = nodes.get(r.get("end"), {}) or {}
+    for key in order:
+        grp = buckets[key]
+        snip = grp["snippet"]
+        doc  = grp["doc"]
+        header = "[snippet: " + (snip if snip else "(no snippet)") + "]"
+        if include_source and doc:
+            header += f" [source: {doc}]"
+        lines.append(header)
 
-        s_props = s.get("props") or {}
-        t_props = t.get("props") or {}
-        s_name = s_props.get("name") or s_props.get("title") or "?"
-        t_name = t_props.get("name") or t_props.get("title") or "?"
-        s_label = (s.get("labels") or ["Entity"])[0]
-        t_label = (t.get("labels") or ["Entity"])[0]
+        rel_lines = grp["rels"]
+        if isinstance(per_snippet_rel_limit, int) and per_snippet_rel_limit > 0 and len(rel_lines) > per_snippet_rel_limit:
+            rel_lines = rel_lines[:per_snippet_rel_limit] + [f"- (+{len(grp['rels']) - per_snippet_rel_limit} more)"]
 
-        rprops = r.get("props") or {}
-        raw = (rprops.get("source_text_full") or rprops.get("source_text") or "").replace("\n", " ").strip()
+        lines.extend(rel_lines)
+        lines.append("")  # blank line between groups
 
-        # unlimited snippet unless a positive `snippet_chars` is provided
-        if isinstance(snippet_chars, int) and snippet_chars > 0 and len(raw) > snippet_chars:
-            snip = raw[:snippet_chars].rstrip() + "..."
-        else:
-            snip = raw
-
-        snip_str = f' [snippet: "{snip}"]' if snip else ""
-        src_str = ""
-        if include_source:
-            ts = titles.get(r.get("start"))
-            te = titles.get(r.get("end"))
-            if ts and te and ts != te:
-                src_str = f' [source: "{ts}" | "{te}"]'
-            elif ts or te:
-                src_str = f' [source: "{ts or te}"]'
-
-        lines.append(
-            f'- {s_label}("{s_name}") -[{r.get("type")}]-> {t_label}("{t_name}"){snip_str}{src_str}'
-        )
-
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
