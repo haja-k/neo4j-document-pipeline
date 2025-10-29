@@ -51,6 +51,43 @@ def test():
         n = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
     return {"nodes": n}
 
+@app.get("/documents")
+def list_documents():
+    """Get a list of all documents stored in Neo4j with their related stats.
+    
+    Returns:
+        dict: Status and list of documents with their titles and related entity counts
+    """
+    try:
+        with driver.session() as session:
+            # Query documents with their entity counts
+            result = session.run("""
+                MATCH (d:Document)
+                OPTIONAL MATCH (d)-[:MENTIONS]->(e)
+                WITH d, count(DISTINCT e) as entityCount
+                OPTIONAL MATCH (n)-[:SOURCE]->(d)
+                WITH d, entityCount, count(DISTINCT n) as sourceNodeCount
+                RETURN {
+                    title: d.title,
+                    entityCount: entityCount,
+                    sourceNodeCount: sourceNodeCount,
+                    uploadedAt: d.uploadedAt
+                } as document
+                ORDER BY d.uploadedAt DESC
+            """)
+            documents = [record["document"] for record in result]
+            
+            return {
+                "success": True,
+                "message": "Documents retrieved successfully",
+                "documents": documents
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to retrieve documents: {str(e)}"
+        }
+
 @app.get("/healthz")
 def healthz():
     try:
@@ -324,6 +361,76 @@ async def upload_and_ingest(file: UploadFile):
     except Exception as e:
         return {"success": False, "message": f"Ingest error: {e}"}
 
+@app.get("/queue_stats")
+def get_queue_stats():
+    """Get statistics about the Celery task queue including active, reserved, and scheduled tasks.
+    
+    Returns:
+        dict: Queue statistics including counts of active, reserved, and scheduled tasks,
+              and details about documents currently being processed
+    """
+    try:
+        from celery_app import celery
+        inspector = celery.control.inspect()
+        
+        # Get active tasks with their details
+        active = inspector.active()
+        active_tasks = []
+        if active:
+            for worker_tasks in active.values():
+                for task in worker_tasks:
+                    # Get document filename from task args if it's an ingest task
+                    if task.get('name') == 'tasks.ingest_markdown_task':
+                        try:
+                            file_path = task.get('args', [None])[0]
+                            if file_path:
+                                filename = os.path.basename(file_path)
+                                active_tasks.append({
+                                    'id': task.get('id'),
+                                    'filename': filename,
+                                    'started_at': task.get('time_start'),
+                                    'worker': task.get('worker')
+                                })
+                        except (IndexError, AttributeError):
+                            pass
+        active_count = len(active_tasks)
+        
+        # Get reserved tasks (tasks that have been claimed by workers but not yet started)
+        reserved = inspector.reserved()
+        reserved_count = sum(len(tasks) for tasks in (reserved or {}).values())
+        
+        # Get scheduled tasks
+        scheduled = inspector.scheduled()
+        scheduled_count = sum(len(tasks) for tasks in (scheduled or {}).values())
+        
+        # Get registered workers
+        workers = inspector.ping() or {}
+        worker_count = len(workers)
+        
+        # Get revoked tasks (cancelled or failed)
+        revoked = inspector.revoked() or {}
+        revoked_count = sum(len(tasks) for tasks in revoked.values())
+        
+        return {
+            "success": True,
+            "message": "Queue statistics retrieved successfully",
+            "stats": {
+                "active_tasks": active_count,
+                "reserved_tasks": reserved_count,
+                "scheduled_tasks": scheduled_count,
+                "revoked_tasks": revoked_count,
+                "total_in_progress": active_count + reserved_count + scheduled_count,
+                "worker_count": worker_count,
+                "workers": list(workers.keys()) if workers else [],
+                "documents_in_progress": active_tasks
+            }
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to retrieve queue statistics: {str(e)}"
+        }
+
 @app.get("/ingest/status")
 def check_status(job_id: str = None):
     """Check status of an ingest job
@@ -346,3 +453,215 @@ def check_status(job_id: str = None):
         "state": result.state,
         "result": result.result
     }
+
+@app.get("/graph/stats")
+def get_graph_statistics():
+    """Get comprehensive statistics about the Neo4j graph database.
+    
+    Returns:
+        dict: Various statistics about nodes, relationships, and database state
+    """
+    try:
+        with driver.session() as session:
+            # Get node statistics by label
+            label_stats = session.run("""
+                CALL db.labels() YIELD label
+                CALL {
+                    WITH label
+                    MATCH (n:`${label}`)
+                    RETURN count(n) as count
+                }
+                RETURN label, count
+                ORDER BY label
+            """)
+            node_counts = {record["label"]: record["count"] for record in label_stats}
+            
+            # Get relationship statistics
+            rel_stats = session.run("""
+                CALL db.relationshipTypes() YIELD relationshipType
+                CALL {
+                    WITH relationshipType
+                    MATCH ()-[r:`${relationshipType}`]->()
+                    RETURN count(r) as count
+                }
+                RETURN relationshipType, count
+                ORDER BY relationshipType
+            """)
+            relationship_counts = {record["relationshipType"]: record["count"] for record in rel_stats}
+            
+            # Get database size info (if available)
+            try:
+                size_info = session.run("""
+                    CALL dbms.database.size('neo4j') YIELD total, free
+                    RETURN total, free
+                """).single()
+                db_size = {
+                    "total": size_info["total"],
+                    "free": size_info["free"],
+                    "used": size_info["total"] - size_info["free"]
+                }
+            except:
+                db_size = None
+            
+            return {
+                "success": True,
+                "message": "Graph statistics retrieved successfully",
+                "statistics": {
+                    "node_counts": node_counts,
+                    "total_nodes": sum(node_counts.values()),
+                    "relationship_counts": relationship_counts,
+                    "total_relationships": sum(relationship_counts.values()),
+                    "database_size": db_size
+                }
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to retrieve graph statistics: {str(e)}"
+        }
+
+@app.get("/graph/schema")
+def get_graph_schema():
+    """Get the current schema of the Neo4j database including node labels, relationship types,
+    and their properties.
+    
+    Returns:
+        dict: Database schema information
+    """
+    try:
+        with driver.session() as session:
+            # Get node labels and their properties
+            node_schema = session.run("""
+                CALL db.labels() YIELD label
+                CALL {
+                    WITH label
+                    MATCH (n:`${label}`)
+                    RETURN DISTINCT keys(n) as properties
+                    LIMIT 1
+                }
+                RETURN label, properties
+                ORDER BY label
+            """)
+            
+            # Get relationship types and their properties
+            rel_schema = session.run("""
+                CALL db.relationshipTypes() YIELD relationshipType
+                CALL {
+                    WITH relationshipType
+                    MATCH ()-[r:`${relationshipType}`]->()
+                    RETURN DISTINCT keys(r) as properties
+                    LIMIT 1
+                }
+                RETURN relationshipType, properties
+                ORDER BY relationshipType
+            """)
+            
+            # Get indexes
+            indexes = session.run("""
+                SHOW INDEXES
+                YIELD name, labelsOrTypes, properties, type
+                RETURN name, labelsOrTypes, properties, type
+            """)
+            
+            return {
+                "success": True,
+                "message": "Schema information retrieved successfully",
+                "schema": {
+                    "nodes": {
+                        record["label"]: record["properties"]
+                        for record in node_schema
+                    },
+                    "relationships": {
+                        record["relationshipType"]: record["properties"]
+                        for record in rel_schema
+                    },
+                    "indexes": [
+                        {
+                            "name": record["name"],
+                            "labels": record["labelsOrTypes"],
+                            "properties": record["properties"],
+                            "type": record["type"]
+                        }
+                        for record in indexes
+                    ]
+                }
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to retrieve schema information: {str(e)}"
+        }
+
+@app.get("/graph/search")
+def search_entities(
+    label: str = None,
+    property_name: str = None,
+    property_value: str = None,
+    limit: int = 10
+):
+    """Search for entities in the graph database based on label and property values.
+    
+    Args:
+        label (str): Optional node label to filter by
+        property_name (str): Name of the property to search
+        property_value (str): Value to search for (supports partial matches)
+        limit (int): Maximum number of results to return
+        
+    Returns:
+        dict: Matching entities and their properties
+    """
+    try:
+        if not property_name or not property_value:
+            return {
+                "success": False,
+                "message": "property_name and property_value are required parameters"
+            }
+            
+        with driver.session() as session:
+            # Build query based on whether label is provided
+            if label:
+                query = f"""
+                MATCH (n:`{label}`)
+                WHERE n.`{property_name}` =~ $value
+                RETURN n
+                LIMIT $limit
+                """
+            else:
+                query = f"""
+                MATCH (n)
+                WHERE n.`{property_name}` =~ $value
+                RETURN n, labels(n) as labels
+                LIMIT $limit
+                """
+            
+            # Execute search with case-insensitive regex
+            results = session.run(
+                query,
+                value=f"(?i).*{property_value}.*",
+                limit=limit
+            )
+            
+            # Format results
+            entities = []
+            for record in results:
+                node = record["n"]
+                entity = {
+                    "labels": record["labels"] if "labels" in record else [label],
+                    "properties": dict(node.items())
+                }
+                entities.append(entity)
+            
+            return {
+                "success": True,
+                "message": "Search completed successfully",
+                "results": {
+                    "count": len(entities),
+                    "entities": entities
+                }
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Search failed: {str(e)}"
+        }
+
