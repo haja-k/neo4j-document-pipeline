@@ -56,9 +56,9 @@ def healthz():
     try:
         with driver.session() as s:
             c = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
-        return {"success": "true", "nodes": c}
+        return {"success": True, "nodes": c}
     except Exception as e:
-        return {"success": "false", "error": str(e)}
+        return {"success": False, "message": "Unhealthy. Error: " + str(e)}
 
 @app.post("/drop-all")
 def drop_all_nodes(confirmation: bool = Body(False)):
@@ -72,7 +72,7 @@ def drop_all_nodes(confirmation: bool = Body(False)):
     """
     if not confirmation:
         return {
-            "success": "false",
+            "success": False,
             "message": "Confirmation required. Set confirmation=true in request body to proceed with deletion."
         }
         
@@ -88,14 +88,14 @@ def drop_all_nodes(confirmation: bool = Body(False)):
             final_count = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
             
             return {
-                "success": "true",
+                "success": True,
                 "message": "Successfully cleared the database",
                 "nodes_before": initial_count,
                 "nodes_after": final_count
             }
     except Exception as e:
         return {
-            "success": "false",
+            "success": False,
             "message": f"Failed to clear database: {str(e)}"
         }
     
@@ -169,7 +169,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
     """
     try:
         if not body.question.strip():
-            return {"success": "false", "message": "Please provide a question.", "answer": "", "facts": "", "seeds": []}
+            return {"success": False, "message": "Please provide a question.", "answer": "", "facts": "", "seeds": []}
 
         timings = {}
         t_total = perf_counter()
@@ -232,8 +232,8 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         print(f"[TIMINGS] {timings}")
 
         return {
-            "success": "true",
-            "message": "Query processed",
+            "success": True,
+            "message": "Query processed.",
             "answer": ans,
             "facts": f"Q: {q0}\n{facts}",
             "seeds": seeds_meta,
@@ -253,7 +253,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
     except Exception as e:
         # Log server-side
         print(f"graphrag error: {e}")
-        return {"success": "false", "message": str(e)}
+        return {"success": False, "message": "Query failed. No knowledge able to be retrieved. Error:" + str(e)}
     
 @app.post("/debug-search")
 def debug_search(body: dict = Body(...)):
@@ -290,20 +290,20 @@ def debug_search(body: dict = Body(...)):
                 label_counts[label] = count_result["count"] if count_result else 0
         
         return {
+            "success": True,
+            "message": "Debug search completed",
             "question": question,
             "existing_labels": existing_labels,
             "existing_indexes": existing_indexes,
             "label_counts": label_counts,
             "hybrid_results_count": len(hybrid_results),
             "default_labels": DEFAULT_LABELS,
-            "status": "success"
         }
         
     except Exception as e:
-        print(f"Debug search error: {e}")
         return {
-            "error": str(e),
-            "status": "error"
+            "success": False,
+            "message": f"Debug search error: {e}"
         }
     
 @app.post("/ingest")
@@ -320,11 +320,9 @@ async def upload_and_ingest(file: UploadFile):
         with open(save_path, "wb") as f:
             f.write(await file.read())
         task = ingest_markdown_task.delay(save_path)
-        return {"success": "true", "message": "Ingestion queued", "job_id": task.id}
+        return {"success": True, "message": "Ingestion queued.", "job_id": task.id}
     except Exception as e:
-        # Log and return a controlled error response
-        print(f"ingest error: {e}")
-        return {"success": "false", "message": str(e)}
+        return {"success": False, "message": f"Ingest error: {e}"}
 
 @app.get("/ingest/status")
 def check_status(job_id: str = None):
@@ -335,14 +333,14 @@ def check_status(job_id: str = None):
     """
     if not job_id:
         return {
-            "success": "false",
-            "message": "job_id parameter is required"
+            "success": False,
+            "message": "Missing value: job_id parameter is required."
         }
         
     from celery_app import celery
     result = celery.AsyncResult(job_id)
     return {
-        "success": "true",
+        "success": True,
         "message": "Job status retrieved",
         "job_id": job_id,
         "state": result.state,
