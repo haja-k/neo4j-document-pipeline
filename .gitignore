@@ -1,2 +1,4 @@
 /uploads
 /import
+/.venv
+neo4j_connect.cpython-39.pyc
