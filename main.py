@@ -56,9 +56,9 @@ def healthz():
     try:
         with driver.session() as s:
             c = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
-        return {"ok": True, "nodes": c}
+        return {"success": "true", "nodes": c}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"success": "false", "error": str(e)}
 
 @app.post("/drop-all")
 def drop_all_nodes(confirmation: bool = Body(False)):
@@ -72,7 +72,7 @@ def drop_all_nodes(confirmation: bool = Body(False)):
     """
     if not confirmation:
         return {
-            "status": "error",
+            "success": "false",
             "message": "Confirmation required. Set confirmation=true in request body to proceed with deletion."
         }
         
@@ -88,14 +88,14 @@ def drop_all_nodes(confirmation: bool = Body(False)):
             final_count = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
             
             return {
-                "status": "success",
+                "success": "true",
                 "message": "Successfully cleared the database",
                 "nodes_before": initial_count,
                 "nodes_after": final_count
             }
     except Exception as e:
         return {
-            "status": "error",
+            "success": "false",
             "message": f"Failed to clear database: {str(e)}"
         }
     
@@ -159,85 +159,101 @@ def verify_embedding_system():
 
 @app.post("/graphrag")
 async def graphrag(body: RagBody = Body(...), request: Request = None):  # async + Request
-    if not body.question.strip():
-        return {"answer": "Please provide a question.", "facts": "", "seeds": []}
+    """Handle graph-RAG queries and return a standardized response.
 
-    timings = {}
-    t_total = perf_counter()
+    Response format (success):
+      {"success": True, "message": "...", "answer": ..., "facts": ..., "seeds": ..., "params": ..., "timings": ...}
 
-    q0 = body.question.strip()
-    labels = body.labels or DEFAULT_LABELS
+    On error:
+      {"success": False, "message": "error message"}
+    """
+    try:
+        if not body.question.strip():
+            return {"success": "false", "message": "Please provide a question.", "answer": "", "facts": "", "seeds": []}
 
-    # 1) Embed question (AWAIT)
-    t = perf_counter()
-    qvec = await get_question_embedding(q0, request=request)
-    timings["embed"] = perf_counter() - t
+        timings = {}
+        t_total = perf_counter()
 
-    # 2) Hybrid candidates (vector + keyword)
-    t = perf_counter()
-    cands = hybrid_candidates(
-        question=q0, qvec=qvec, labels=labels,
-        k_vec=max(12, body.top_k), k_kw=max(12, body.top_k),
-        alpha_vec=body.alpha_vec, beta_kw=body.beta_kw
-    )
-    timings["hybrid"] = perf_counter() - t
+        q0 = body.question.strip()
+        labels = body.labels or DEFAULT_LABELS
 
-    # 3) MMR diversification
-    if body.use_mmr and len(cands) > body.top_k:
+        # 1) Embed question (AWAIT)
         t = perf_counter()
-        cands = mmr_select(cands, k=body.top_k)
-        timings["mmr"] = perf_counter() - t
-    else:
-        cands = cands[:body.top_k]
+        qvec = await get_question_embedding(q0, request=request)
+        timings["embed"] = perf_counter() - t
 
-    # 4) Cross-document coverage
-    if body.use_cross_doc and len(cands) > 1:
+        # 2) Hybrid candidates (vector + keyword)
         t = perf_counter()
-        cands = diversify_by_document(cands, k=len(cands))
-        timings["cross_doc"] = perf_counter() - t
+        cands = hybrid_candidates(
+            question=q0, qvec=qvec, labels=labels,
+            k_vec=max(12, body.top_k), k_kw=max(12, body.top_k),
+            alpha_vec=body.alpha_vec, beta_kw=body.beta_kw
+        )
+        timings["hybrid"] = perf_counter() - t
 
-    # 5) Expand neighbors
-    t = perf_counter()
-    seed_ids = [n.element_id for n, _ in cands]
-    expanded = traverse_neighbors(
-        seed_ids,
-        max_hops=max(1, min(body.hops, 3))
-    )
-    timings["graph_traverse"] = perf_counter() - t
+        # 3) MMR diversification
+        if body.use_mmr and len(cands) > body.top_k:
+            t = perf_counter()
+            cands = mmr_select(cands, k=body.top_k)
+            timings["mmr"] = perf_counter() - t
+        else:
+            cands = cands[:body.top_k]
 
-    # 6) Format context (final step now)
-    t = perf_counter()
-    facts = format_graph_context(expanded, max_lines=None, snippet_chars=None, include_source=True)
-    timings["format_context"] = perf_counter() - t
-    
-    # No LLM step — return the context as the "answer"
-    ans = facts
+        # 4) Cross-document coverage
+        if body.use_cross_doc and len(cands) > 1:
+            t = perf_counter()
+            cands = diversify_by_document(cands, k=len(cands))
+            timings["cross_doc"] = perf_counter() - t
 
-    # seeds meta
-    seeds_meta = [
-        {"labels": list(n.labels), "name": n.get("name") or n.get("title"), "score": sc}
-        for n, sc in cands
-    ]
+        # 5) Expand neighbors
+        t = perf_counter()
+        seed_ids = [n.element_id for n, _ in cands]
+        expanded = traverse_neighbors(
+            seed_ids,
+            max_hops=max(1, min(body.hops, 3))
+        )
+        timings["graph_traverse"] = perf_counter() - t
 
-    timings["total"] = perf_counter() - t_total
-    print(f"[TIMINGS] {timings}")
+        # 6) Format context (final step now)
+        t = perf_counter()
+        facts = format_graph_context(expanded, max_lines=None, snippet_chars=None, include_source=True)
+        timings["format_context"] = perf_counter() - t
 
-    return {
-        "answer": ans,
-        "facts": f"Q: {q0}\n{facts}",
-        "seeds": seeds_meta,
-        "params": {
-            "top_k": body.top_k,
-            "hops": body.hops,
-            "labels": labels,
-            "alpha_vec": body.alpha_vec,
-            "beta_kw": body.beta_kw,
-            "use_mmr": body.use_mmr,
-            "use_cross_doc": body.use_cross_doc,
-            "used_llm": False,
-        },
-        "timings": timings,
-    }
+        # No LLM step — return the context as the "answer"
+        ans = facts
+
+        # seeds meta
+        seeds_meta = [
+            {"labels": list(n.labels), "name": n.get("name") or n.get("title"), "score": sc}
+            for n, sc in cands
+        ]
+
+        timings["total"] = perf_counter() - t_total
+        print(f"[TIMINGS] {timings}")
+
+        return {
+            "success": "true",
+            "message": "Query processed",
+            "answer": ans,
+            "facts": f"Q: {q0}\n{facts}",
+            "seeds": seeds_meta,
+            "params": {
+                "top_k": body.top_k,
+                "hops": body.hops,
+                "labels": labels,
+                "alpha_vec": body.alpha_vec,
+                "beta_kw": body.beta_kw,
+                "use_mmr": body.use_mmr,
+                "use_cross_doc": body.use_cross_doc,
+                "used_llm": False,
+            },
+            "timings": timings,
+        }
+
+    except Exception as e:
+        # Log server-side
+        print(f"graphrag error: {e}")
+        return {"success": "false", "message": str(e)}
     
 @app.post("/debug-search")
 def debug_search(body: dict = Body(...)):
@@ -292,15 +308,23 @@ def debug_search(body: dict = Body(...)):
     
 @app.post("/ingest")
 async def upload_and_ingest(file: UploadFile):
-    file_id = str(uuid.uuid4())
-    dir_path = os.path.join(UPLOAD_DIR, file_id)
-    os.makedirs(dir_path, exist_ok=True)
-    save_path = os.path.join(dir_path, file.filename)
-    with open(save_path, "wb") as f:
-        f.write(await file.read())
+    """Upload a file and queue ingest task. Returns standardized response with success and message.
 
-    task = ingest_markdown_task.delay(save_path)
-    return {"job_id": task.id, "status": "queued"}
+    Expects multipart/form-data with file field.
+    """
+    try:
+        file_id = str(uuid.uuid4())
+        dir_path = os.path.join(UPLOAD_DIR, file_id)
+        os.makedirs(dir_path, exist_ok=True)
+        save_path = os.path.join(dir_path, file.filename)
+        with open(save_path, "wb") as f:
+            f.write(await file.read())
+        task = ingest_markdown_task.delay(save_path)
+        return {"success": "true", "message": "Ingestion queued", "job_id": task.id}
+    except Exception as e:
+        # Log and return a controlled error response
+        print(f"ingest error: {e}")
+        return {"success": "false", "message": str(e)}
 
 @app.get("/ingest/status")
 def check_status(job_id: str = None):
@@ -311,13 +335,15 @@ def check_status(job_id: str = None):
     """
     if not job_id:
         return {
-            "status": "error",
+            "success": "false",
             "message": "job_id parameter is required"
         }
         
     from celery_app import celery
     result = celery.AsyncResult(job_id)
     return {
+        "success": "true",
+        "message": "Job status retrieved",
         "job_id": job_id,
         "state": result.state,
         "result": result.result
