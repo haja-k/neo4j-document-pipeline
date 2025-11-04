@@ -196,14 +196,6 @@ def verify_embedding_system():
 
 @app.post("/graphrag")
 async def graphrag(body: RagBody = Body(...), request: Request = None):  # async + Request
-    """Handle graph-RAG queries and return a standardized response.
-
-    Response format (success):
-      {"success": True, "message": "...", "answer": ..., "facts": ..., "seeds": ..., "params": ..., "timings": ...}
-
-    On error:
-      {"success": False, "message": "error message"}
-    """
     try:
         if not body.question.strip():
             return {"success": False, "message": "Please provide a question.", "answer": "", "facts": "", "seeds": []}
@@ -228,7 +220,29 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         )
         timings["hybrid"] = perf_counter() - t
 
-        # 3) MMR diversification
+        # 3) Early "no data" check
+        if not cands:
+            msg = "There is no available data related to the user query."
+            return {
+                "success": True,
+                "message": msg,
+                "answer": msg,
+                "facts": f"Q: {q0}\nGraph Facts: (no results)",
+                "seeds": [],
+                "params": {
+                    "top_k": body.top_k,
+                    "hops": body.hops,
+                    "labels": labels,
+                    "alpha_vec": body.alpha_vec,
+                    "beta_kw": body.beta_kw,
+                    "use_mmr": body.use_mmr,
+                    "use_cross_doc": body.use_cross_doc,
+                    "used_llm": False,
+                },
+                "timings": timings,
+            }
+
+        # 4) MMR diversification
         if body.use_mmr and len(cands) > body.top_k:
             t = perf_counter()
             cands = mmr_select(cands, k=body.top_k)
@@ -236,25 +250,66 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         else:
             cands = cands[:body.top_k]
 
-        # 4) Cross-document coverage
+        # 5) Cross-document coverage
         if body.use_cross_doc and len(cands) > 1:
             t = perf_counter()
             cands = diversify_by_document(cands, k=len(cands))
             timings["cross_doc"] = perf_counter() - t
 
-        # 5) Expand neighbors
+        # 6) Expand neighbors
         t = perf_counter()
-        seed_ids = [n.element_id for n, _ in cands]
+        raw_seed_ids = [n.element_id for n, _ in cands]
+        with driver.session() as s:
+            recs = s.run("""
+                UNWIND $ids AS id
+                MATCH (n) WHERE elementId(n) = id
+                OPTIONAL MATCH (d:Document)-[:MENTIONS]->(n)
+                WITH id, collect(d.doc_id) AS docs
+                RETURN id, CASE WHEN size(docs) > 0 THEN docs[0] ELSE id END AS doc
+            """, {"ids": raw_seed_ids}).data()
+
+        seen_docs = set()
+        seed_ids = []
+        for r in recs:
+            doc = r["doc"]
+            node_id = r["id"]
+            if doc in seen_docs:
+                continue
+            seen_docs.add(doc)
+            seed_ids.append(node_id)
+            
         expanded = traverse_neighbors(
             seed_ids,
             max_hops=max(1, min(body.hops, 3))
         )
         timings["graph_traverse"] = perf_counter() - t
 
-        # 6) Format context (final step now)
+        # 7) Format context
         t = perf_counter()
         facts = format_graph_context(expanded, max_lines=None, snippet_chars=None, include_source=True)
         timings["format_context"] = perf_counter() - t
+
+        # If no facts at all, emit a clear, user-friendly message
+        if facts.strip().endswith("(no results)"):
+            msg = "There is no available data related to the user query."
+            return {
+                "success": True,
+                "message": msg,
+                "answer": msg,
+                "facts": f"Q: {q0}\n{facts}",
+                "seeds": [],
+                "params": {
+                    "top_k": body.top_k,
+                    "hops": body.hops,
+                    "labels": labels,
+                    "alpha_vec": body.alpha_vec,
+                    "beta_kw": body.beta_kw,
+                    "use_mmr": body.use_mmr,
+                    "use_cross_doc": body.use_cross_doc,
+                    "used_llm": False,
+                },
+                "timings": timings,
+            }
 
         # No LLM step — return the context as the "answer"
         ans = facts
