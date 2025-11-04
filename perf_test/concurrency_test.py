@@ -49,23 +49,52 @@ QUESTIONS = [
 # ========================================
 
 def send_request(question):
-    """Send a single request and return success status and response time."""
+    """Send a single request and return details."""
     payload = {"question": question}
     start_time = time.time()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=TIMEOUT)
         response_time = (time.time() - start_time) * 1000  # ms
         if response.status_code == 200:
             data = response.json()
             if data.get("success", False):
-                return True, response_time, None  # Success
+                return {
+                    "timestamp": timestamp,
+                    "question": question,
+                    "success": True,
+                    "response_time": response_time,
+                    "response": json.dumps(data),
+                    "error": None
+                }
             else:
-                return False, response_time, "API returned success: false"
+                return {
+                    "timestamp": timestamp,
+                    "question": question,
+                    "success": False,
+                    "response_time": response_time,
+                    "response": json.dumps(data),
+                    "error": "API returned success: false"
+                }
         else:
-            return False, response_time, f"HTTP {response.status_code}"
+            return {
+                "timestamp": timestamp,
+                "question": question,
+                "success": False,
+                "response_time": response_time,
+                "response": response.text,
+                "error": f"HTTP {response.status_code}"
+            }
     except Exception as e:
         response_time = (time.time() - start_time) * 1000
-        return False, response_time, str(e)
+        return {
+            "timestamp": timestamp,
+            "question": question,
+            "success": False,
+            "response_time": response_time,
+            "response": None,
+            "error": str(e)
+        }
 
 def test_concurrency(num_concurrent):
     """Test with num_concurrent requests."""
@@ -75,8 +104,8 @@ def test_concurrency(num_concurrent):
         results = [future.result() for future in concurrent.futures.as_completed(futures)]
     
     # Check if all succeeded
-    all_success = all(success for success, _, _ in results)
-    avg_response_time = sum(rt for _, rt, _ in results) / len(results) if results else 0
+    all_success = all(r["success"] for r in results)
+    avg_response_time = sum(r["response_time"] for r in results) / len(results) if results else 0
     return all_success, avg_response_time, results
 
 # ========================================
@@ -88,16 +117,8 @@ def save_results(all_results, summary_rows):
 
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
         for level, records in all_results.items():
-            # records is list of (success, rt, error)
-            df_data = []
-            for i, (success, rt, error) in enumerate(records):
-                df_data.append({
-                    "Request ID": i + 1,
-                    "Success": success,
-                    "Response Time (ms)": round(rt, 2),
-                    "Error": error
-                })
-            df = pd.DataFrame(df_data)
+            # records is list of dicts
+            df = pd.DataFrame(records)
             df.to_excel(writer, sheet_name=level, index=False)
 
         if summary_rows:
@@ -132,7 +153,9 @@ if __name__ == "__main__":
             "Concurrency Level": num_concurrent,
             "Success": success,
             "Avg Response Time (ms)": round(avg_rt, 2),
-            "Details": str(details)
+            "Total Requests": len(details),
+            "Successful Requests": sum(1 for r in details if r["success"]),
+            "Failed Requests": sum(1 for r in details if not r["success"])
         })
         
         if success:
