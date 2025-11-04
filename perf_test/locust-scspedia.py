@@ -1,26 +1,36 @@
 from locust import HttpUser, task, events, between
 import json
 import gevent
+from gevent.event import Event
 import time
 import uuid
 import requests
 from datetime import datetime, timezone
 import pandas as pd
 import random
+import sys
+
+# Force UTF-8 encoding for console output
+import sys
+import codecs
+sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
 
 # ========================================
 # CONFIG
 # ========================================
 
-API_URL = "https://i-scs.sarawak.gov.my/v1/chat-messages"
-API_KEY = "app-2coFsitSt2Up0L5X4ViZe06V" #hybrid model
-
+API_URL = " "
+API_KEY = " " #hybrid model
 
 MAX_USERS = 100
 FAIL_THRESHOLD = 1  # percent fail stop
+MAX_RESPONSE_TIME = 30000  # maximum acceptable response time in milliseconds
 
+# Global state management
 all_results = {}
 summary_rows = []
+test_stop_event = Event()  # Global event to signal test stop
+active_users = 0  # Track current active users
 
 # ========================================
 # QUESTION LIST
@@ -56,12 +66,31 @@ QUESTIONS = [
 class ChatUser(HttpUser):
     host = "https://i-scs.sarawak.gov.my/"
     wait_time = between(0, 0)
+    
+    def on_start(self):
+        """Called when a user starts."""
+        global active_users
+        if active_users >= MAX_USERS:
+            print(f" Maximum users ({MAX_USERS}) reached. Stopping test.")
+            test_stop_event.set()
+            self.environment.runner.quit()
+            return False
+        active_users += 1
+            
+    def on_stop(self):
+        """Called when a user stops."""
+        global active_users
+        active_users -= 1
+        print(f"[USER] User stopped. Active users: {active_users}")
 
     @task
     def send_chat(self):
         """Send SSE streaming request and capture detailed metrics."""
+        if test_stop_event.is_set():
+            self.environment.runner.quit()
+            return
+            
         question = random.choice(QUESTIONS)
-
         headers = {
             "Authorization": f"Bearer {API_KEY}",
             "Accept": "text/event-stream",
@@ -78,7 +107,6 @@ class ChatUser(HttpUser):
         start_time = time.time()
 
         record = {
-            # use timezone-aware UTC timestamp to avoid deprecation warnings
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z"),
             "user_id": user_id,
             "conversation_id": "",
@@ -93,7 +121,8 @@ class ChatUser(HttpUser):
             "output_tokens": None,
             "total_tokens": None,
             "status": "failed",
-            "fail_reason": ""
+            "fail_reason": "",
+            "response_time": None
         }
 
         last_event = None
@@ -102,10 +131,22 @@ class ChatUser(HttpUser):
             with requests.post(API_URL, headers=headers, json=payload, stream=True, timeout=400) as resp:
                 if resp.status_code != 200:
                     record["fail_reason"] = f"HTTP {resp.status_code}"
+                    record["response_time"] = (time.time() - start_time) * 1000
+                    events.request.fire(
+                        request_type="SSE",
+                        name="chat",
+                        response_time=record["response_time"],
+                        response_length=0,
+                        exception=Exception(f"HTTP {resp.status_code}")
+                    )
                     return record
 
                 ttft = None
                 for line in resp.iter_lines(decode_unicode=True):
+                    if test_stop_event.is_set():
+                        record["fail_reason"] = "Test stopped"
+                        break
+                        
                     if not line or not line.startswith("data:"):
                         continue
                     data_str = line[5:].strip()
@@ -116,12 +157,16 @@ class ChatUser(HttpUser):
 
                     event_name = data.get("event")
                     if event_name:
-                        last_event = event_name  # Track last event received
+                        last_event = event_name
 
                     # First token time
                     if not ttft:
-                        ttft = (time.time() - start_time) * 1000  # ms
+                        ttft = (time.time() - start_time) * 1000
                         record["ttft_ms"] = round(ttft, 2)
+                        if ttft > MAX_RESPONSE_TIME:
+                            test_stop_event.set()
+                            record["fail_reason"] = f"TTFT exceeded {MAX_RESPONSE_TIME}ms"
+                            break
 
                     # Capture streaming content
                     if event_name == "message":
@@ -177,67 +222,125 @@ def on_locust_init(environment, **_kwargs):
 
 
 def run_incremental_test(environment):
-    print("\n🚀 Starting Sequential SSE Load Test (1→2→3→...→MAX_USERS)\n")
+    print("\n Starting Sequential SSE Load Test (1-2-3-...->MAX_USERS)\n")
+    
+    test_stop_event.clear()  # Reset stop event at start
+    global active_users
+    active_users = 0  # Reset active users count at start
+    
+    try:
+        for current_users in range(6, MAX_USERS + 1):
+            if test_stop_event.is_set() or active_users >= MAX_USERS:
+                print("\n Test stopped due to failure conditions or max users reached.")
+                print(f"Current active users: {active_users}")
+                break
+                
+            print(f"\n Step {current_users}: Running {current_users} concurrent users...")
+            user_greenlets = []
+            step_results = []
+            
+            # Spawn users
+            for _ in range(current_users):
+                if test_stop_event.is_set():
+                    break
+                user = ChatUser(environment)
+                g = gevent.spawn(run_user_request, user, step_results)
+                user_greenlets.append(g)
+                
+            # Wait for all users to complete or test to stop
+            gevent.joinall(user_greenlets, timeout=10)
+            
+            # Kill any remaining greenlets if test was stopped
+            if test_stop_event.is_set():
+                for g in user_greenlets:
+                    if not g.dead:
+                        g.kill()
+                        
+            total = len(step_results)
+            failed = len([r for r in step_results if r["status"] == "failed"])
+            fail_rate = (failed / total * 100) if total else 0
+            
+            # Calculate metrics
+            all_results[f"Step_{current_users}"] = step_results
+            successful_results = [r for r in step_results if r["latency_ms"]]
+            
+            if successful_results:
+                avg_latency = sum(r["latency_ms"] for r in successful_results) / len(successful_results)
+            else:
+                avg_latency = 0
+                
+            summary_rows.append({
+                "Step": current_users,
+                "Total Requests": total,
+                "Failed": failed,
+                "Fail Rate (%)": round(fail_rate, 2),
+                "Avg Latency (ms)": round(avg_latency, 2),
+            })
+            
+            print(f" Step {current_users}: {total} total, {failed} failed, Fail rate {fail_rate:.2f}%")
+            
+            # Check failure conditions
+            if fail_rate >= FAIL_THRESHOLD:
+                print(f"\n Fail rate exceeded {FAIL_THRESHOLD}%. Stopping test.")
+                test_stop_event.set()
+                break
+                
+            if avg_latency > MAX_RESPONSE_TIME:
+                print(f"\n Average response time ({avg_latency:.2f}ms) exceeded threshold ({MAX_RESPONSE_TIME}ms). Stopping test.")
+                test_stop_event.set()
+                break
+                
+    except KeyboardInterrupt:
+        print("\n Test interrupted by user.")
+        test_stop_event.set()
+    except Exception as e:
+        print(f"\n Test error: {str(e)}")
+        test_stop_event.set()
+    finally:
+        # Ensure cleanup happens
+        test_stop_event.set()
 
-    #incremental test
-    for current_users in range(40, MAX_USERS + 1):
-        print(f"\n🧩 Step {current_users}: Running {current_users} concurrent users...")
-        user_greenlets = []
-        step_results = []
-
-    # #direct number of test
-    # for current_users in [50]:
-    #     print(f"\n🧩 Step {current_users}: Running {current_users} concurrent users...")
-    #     user_greenlets = []
-    #     step_results = []
-
-        for _ in range(current_users):
-            user = ChatUser(environment)
-            g = gevent.spawn(run_user_request, user, step_results)
-            user_greenlets.append(g)
-
-        gevent.joinall(user_greenlets)
-
-        total = len(step_results)
-        failed = len([r for r in step_results if r["status"] == "failed"])
-        fail_rate = (failed / total * 100) if total else 0
-
-        all_results[f"Step_{current_users}"] = step_results
-        avg_latency = (
-            sum(r["latency_ms"] for r in step_results if r["latency_ms"]) /
-            max(1, len([r for r in step_results if r["latency_ms"]]))
-        )
-
-        summary_rows.append({
-            "Step": current_users,
-            "Total Requests": total,
-            "Failed": failed,
-            "Fail Rate (%)": round(fail_rate, 2),
-            "Avg Latency (ms)": round(avg_latency, 2),
-        })
-
-        print(f"📊 Step {current_users}: {total} total, {failed} failed, Fail rate {fail_rate:.2f}%")
-
-        if fail_rate >= FAIL_THRESHOLD:
-            print(f"\n🛑 Fail rate exceeded {FAIL_THRESHOLD}%. Stopping early.")
-            break
-
-    print("\n✅ Test finished or stopped.")
+    print("\n Test finished or stopped.")
     save_results(all_results, summary_rows)
     environment.runner.quit()
     environment.runner.greenlet.kill()
 
 
 def run_user_request(user, step_results):
-    record = user.send_chat()
-    step_results.append(record)
-    if record["status"] == "failed":
-        print(f"❌ {record['user_id']} failed: {record['fail_reason']}")
-    else:
-        print(
-            f"✅ {record['user_id']} success | latency={record['latency_ms']}ms | "
-            f"elapsed={record['elapsed_time_ms']}ms"
-        )
+    try:
+        if test_stop_event.is_set() or active_users >= MAX_USERS:
+            return
+            
+        record = user.send_chat()
+        if record:  # Only process if we got a record back
+            step_results.append(record)
+            
+            if record["status"] == "failed":
+                print(f" {record['user_id']} failed: {record['fail_reason']}")
+                events.request.fire(
+                    request_type="SSE",
+                    name="chat",
+                    response_time=record.get("response_time", 0),
+                    response_length=0,
+                    exception=Exception(record["fail_reason"])
+                )
+            else:
+                print(
+                    f" {record['user_id']} success | latency={record['latency_ms']}ms | "
+                    f"elapsed={record['elapsed_time_ms']}ms"
+                )
+                events.request.fire(
+                    request_type="SSE",
+                    name="chat",
+                    response_time=record["latency_ms"],
+                    response_length=len(record["response"]),
+                    exception=None
+                )
+            
+    except Exception as e:
+        print(f" Unexpected error in user request: {str(e)}")
+        if not test_stop_event.is_set():
+            test_stop_event.set()
 
 
 # ========================================
@@ -256,5 +359,5 @@ def save_results(all_results, summary_rows):
             summary_df = pd.DataFrame(summary_rows)
             summary_df.to_excel(writer, sheet_name="Summary", index=False)
 
-    print(f"\n📘 Results saved to {filename}")
-    print(f"📈 Summary includes {len(summary_rows)} steps.\n")
+    print(f"\n Results saved to {filename}")
+    print(f" Summary includes {len(summary_rows)} steps.\n")
