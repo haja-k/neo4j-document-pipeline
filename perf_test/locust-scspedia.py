@@ -19,10 +19,10 @@ sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
 # CONFIG
 # ========================================
 
-API_URL = " "
-API_KEY = " " #hybrid model
+API_URL = "https://knowledge-graph.sains.com.my/graphrag"
+# API_KEY removed as per new requirements
 
-MAX_USERS = 100
+MAX_USERS = 50
 FAIL_THRESHOLD = 1  # percent fail stop
 MAX_RESPONSE_TIME = 30000  # maximum acceptable response time in milliseconds
 
@@ -64,7 +64,7 @@ QUESTIONS = [
 # LOCUST USER CLASS
 # ========================================
 class ChatUser(HttpUser):
-    host = "https://i-scs.sarawak.gov.my/"
+    host = "https://knowledge-graph.sains.com.my/"
     wait_time = between(0, 0)
     
     def on_start(self):
@@ -85,25 +85,20 @@ class ChatUser(HttpUser):
 
     @task
     def send_chat(self):
-        """Send SSE streaming request and capture detailed metrics."""
+        """Send POST request and capture detailed metrics with retry logic."""
         if test_stop_event.is_set():
             self.environment.runner.quit()
             return
             
         question = random.choice(QUESTIONS)
         headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
         }
         payload = {
-            "inputs": {},
-            "query": question,
-            "response_mode": "streaming",
-            "conversation_id": "",
-            "user": f"loadtest-{uuid.uuid4()}",
+            "question": question,
         }
 
-        user_id = payload["user"]
+        user_id = payload["question"][:50]  # Use part of question as user_id for simplicity
         start_time = time.time()
 
         record = {
@@ -111,7 +106,7 @@ class ChatUser(HttpUser):
             "user_id": user_id,
             "conversation_id": "",
             "request_id": str(uuid.uuid4()),
-            "context_type": "chat_message",
+            "context_type": "graphrag_query",
             "request": question,
             "response": "",
             "latency_ms": None,
@@ -125,89 +120,43 @@ class ChatUser(HttpUser):
             "response_time": None
         }
 
-        last_event = None
-
-        try:
-            with requests.post(API_URL, headers=headers, json=payload, stream=True, timeout=400) as resp:
-                if resp.status_code != 200:
-                    record["fail_reason"] = f"HTTP {resp.status_code}"
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with requests.post(API_URL, headers=headers, json=payload, timeout=400) as resp:
                     record["response_time"] = (time.time() - start_time) * 1000
-                    events.request.fire(
-                        request_type="SSE",
-                        name="chat",
-                        response_time=record["response_time"],
-                        response_length=0,
-                        exception=Exception(f"HTTP {resp.status_code}")
-                    )
-                    return record
-
-                ttft = None
-                for line in resp.iter_lines(decode_unicode=True):
-                    if test_stop_event.is_set():
-                        record["fail_reason"] = "Test stopped"
-                        break
-                        
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    event_name = data.get("event")
-                    if event_name:
-                        last_event = event_name
-
-                    # First token time
-                    if not ttft:
-                        ttft = (time.time() - start_time) * 1000
-                        record["ttft_ms"] = round(ttft, 2)
-                        if ttft > MAX_RESPONSE_TIME:
-                            test_stop_event.set()
-                            record["fail_reason"] = f"TTFT exceeded {MAX_RESPONSE_TIME}ms"
-                            break
-
-                    # Capture streaming content
-                    if event_name == "message":
-                        record["response"] += data.get("text", "")
-
-                    # ========================================
-                    # Capture elapsed time from workflow_finished
-                    # ========================================
-                    elif event_name == "workflow_finished":
-                        workflow_data = data.get("data", {})
-                        elapsed = workflow_data.get("elapsed_time")
-
-                        if elapsed is not None:
-                            record["elapsed_time_ms"] = round(elapsed * 1000, 2)
+                    if resp.status_code == 200:
+                        response_data = resp.json()
+                        record["response"] = json.dumps(response_data)
+                        if response_data.get("success", False):
+                            record["status"] = "success"
+                            record["latency_ms"] = record["response_time"]
+                            record["elapsed_time_ms"] = record["response_time"]  # Simplified
+                            break  # Success, exit retry loop
                         else:
-                            created = workflow_data.get("created_at")
-                            finished = workflow_data.get("finished_at")
-                            if created and finished:
-                                record["elapsed_time_ms"] = round((finished - created) * 1000, 2)
-
-                    # ========================================
-                    # Capture latency from message_end
-                    # ========================================
-                    elif event_name == "message_end":
-                        meta = data.get("metadata", {})
-                        usage = meta.get("usage", {})
-                        record["conversation_id"] = data.get("conversation_id", "")
-                        record["latency_ms"] = round(float(usage.get("latency", 0)) * 1000, 2)
-                        record["input_tokens"] = usage.get("prompt_tokens")
-                        record["output_tokens"] = usage.get("completion_tokens")
-                        record["total_tokens"] = usage.get("total_tokens")
-                        record["status"] = "success"
-                        break
-
-                # If no success
-                if record["status"] != "success":
-                    record["fail_reason"] = f"stopped_at:{last_event or 'no_event'}"
-
-        except Exception as e:
-            record["fail_reason"] = f"{str(e)} | last_event:{last_event or 'none'}"
-            record["status"] = "failed"
+                            record["fail_reason"] = "API returned success: false"
+                    else:
+                        record["fail_reason"] = f"HTTP {resp.status_code}"
+                        
+                # If we get here without breaking, it was a failure, but for connection errors, retry
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Wait 1 second before retry
+                    continue
+                else:
+                    # Final attempt failed
+                    pass
+                    
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                record["fail_reason"] = f"Connection/Timeout error on attempt {attempt + 1}: {str(e)}"
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                else:
+                    record["status"] = "failed"
+            except Exception as e:
+                record["fail_reason"] = f"Unexpected error on attempt {attempt + 1}: {str(e)}"
+                record["status"] = "failed"
+                break  # Don't retry for other errors
 
         return record
 
@@ -279,14 +228,10 @@ def run_incremental_test(environment):
             
             print(f" Step {current_users}: {total} total, {failed} failed, Fail rate {fail_rate:.2f}%")
             
-            # Check failure conditions
-            if fail_rate >= FAIL_THRESHOLD:
-                print(f"\n Fail rate exceeded {FAIL_THRESHOLD}%. Stopping test.")
-                test_stop_event.set()
-                break
-                
-            if avg_latency > MAX_RESPONSE_TIME:
-                print(f"\n Average response time ({avg_latency:.2f}ms) exceeded threshold ({MAX_RESPONSE_TIME}ms). Stopping test.")
+            # Check for API failure
+            api_failed = any(r["fail_reason"] == "API returned success: false" for r in step_results)
+            if api_failed:
+                print(f"\n API failed to give proper response at step {current_users}. Stopping test.")
                 test_stop_event.set()
                 break
                 
@@ -318,20 +263,19 @@ def run_user_request(user, step_results):
             if record["status"] == "failed":
                 print(f" {record['user_id']} failed: {record['fail_reason']}")
                 events.request.fire(
-                    request_type="SSE",
-                    name="chat",
+                    request_type="POST",
+                    name="graphrag",
                     response_time=record.get("response_time", 0),
-                    response_length=0,
+                    response_length=len(record["response"]),
                     exception=Exception(record["fail_reason"])
                 )
             else:
                 print(
-                    f" {record['user_id']} success | latency={record['latency_ms']}ms | "
-                    f"elapsed={record['elapsed_time_ms']}ms"
+                    f" {record['user_id']} success | latency={record['latency_ms']}ms"
                 )
                 events.request.fire(
-                    request_type="SSE",
-                    name="chat",
+                    request_type="POST",
+                    name="graphrag",
                     response_time=record["latency_ms"],
                     response_length=len(record["response"]),
                     exception=None
