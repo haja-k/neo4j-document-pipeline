@@ -126,17 +126,8 @@ async def _sains_vllm_embed(text: str, request=None, max_retries: int = 3) -> Li
                 print(f"[VLLM-EMBED-RETRY] Attempt {attempt + 1}/{max_retries} failed with {error_name}: {e}. Retrying in {wait_time}s...")
                 await asyncio.sleep(wait_time)
             else:
-                print(f"            else:
                 print(f"[VLLM-EMBED-ERROR] All {max_retries} attempts failed: {error_name}: {e}")
                 raise
-
-
-async def get_question_embedding(question: str, request=None, max_retries: int = 3) -> List[float]:")
-                raise
-    elapsed = time.perf_counter() - t0
-    print(f"[DEBUG] Embedding HTTP call took {elapsed:.3f}s, status={resp.status_code}")
-    resp.raise_for_status()
-    return resp.json()["data"][0]["embedding"]
 
 
 async def get_question_embedding(question: str, request=None, max_retries: int = 3) -> List[float]:
