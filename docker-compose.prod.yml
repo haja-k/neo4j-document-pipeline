@@ -21,7 +21,7 @@ services:
       NEO4J_server_memory_pagecache_size: "512M"
       NEO4J_dbms_memory_transaction_total_max: "256M"
       NEO4J_server_bolt_thread__pool__min__size: "5"
-      NEO4J_server_bolt_thread__pool__max__size: "20"
+      NEO4J_server_bolt_thread__pool__max__size: "100"
       NEO4J_dbms_transaction_timeout: "30s"
       NEO4J_server_bolt_connection__keep__alive: "1m"
     volumes:
@@ -49,7 +49,7 @@ services:
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: "12345678"
       # Connection pooling settings (adjust in your app code)
-      NEO4J_MAX_CONNECTION_POOL_SIZE: "50"
+      NEO4J_MAX_CONNECTION_POOL_SIZE: "100"
       NEO4J_CONNECTION_ACQUISITION_TIMEOUT: "30"
     depends_on:
       - neo4j

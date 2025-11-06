@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from tasks import ingest_markdown_task
 from pydantic import BaseModel, Field
 from time import perf_counter
-from neo4j_connect import driver
+from neo4j_connect import driver, close_driver
 from graphutil import (
     init_clients,
     get_question_embedding,
@@ -194,6 +194,12 @@ def verify_embedding_system():
             print(f"❌ Verification failed: {e}")
             break
 
+@app.on_event("shutdown")
+def shutdown_event():
+    """Close Neo4j driver on shutdown"""
+    close_driver()
+    print("✅ Neo4j driver closed")
+
 @app.post("/graphrag")
 async def graphrag(body: RagBody = Body(...), request: Request = None):  # async + Request
     try:
@@ -342,10 +348,22 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
             "timings": timings,
         }
 
+    except ServiceUnavailable as e:
+        # Log server-side
+        print(f"Neo4j connection error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False, 
+            "message": "Database temporarily unavailable. Please try again.",
+            "error_type": "connection"
+        }
     except Exception as e:
         # Log server-side
         print(f"graphrag error: {e}")
-        return {"success": False, "message": "Query failed. No knowledge able to be retrieved. Error:" + str(e)}
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "message": f"Query failed. No knowledge able to be retrieved. Error: {str(e)}"}
     
 @app.post("/debug-search")
 def debug_search(body: dict = Body(...)):
