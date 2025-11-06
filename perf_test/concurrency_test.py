@@ -113,7 +113,7 @@ def test_concurrency(num_concurrent):
 # ========================================
 def save_results(all_results, summary_rows):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"concurrency_test_results_{timestamp}.xlsx"
+    filename = f"concurrency_i-scs_{timestamp}.xlsx"
 
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
         for level, records in all_results.items():
