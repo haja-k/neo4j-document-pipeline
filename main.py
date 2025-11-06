@@ -137,7 +137,7 @@ def drop_all_nodes(confirmation: bool = Body(False)):
         }
     
 @app.on_event("startup")
-def verify_embedding_system():
+async def verify_embedding_system():
     """Verify embedding system with retry logic for Neo4j connection"""
     max_retries = 10
     retry_delay = 5  # seconds
@@ -154,8 +154,8 @@ def verify_embedding_system():
                 if result.single()["test"] == 1:
                     print("✅ Neo4j connection successful")
             
-            # Test embedding generation
-            test_embedding = get_question_embedding("test question")
+            # Test embedding generation (await the async function)
+            test_embedding = await get_question_embedding("test question")
             actual_dimensions = len(test_embedding)
             print(f"🔍 Embedding system: {actual_dimensions} dimensions")
             
@@ -385,14 +385,14 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         }
     
 @app.post("/debug-search")
-def debug_search(body: dict = Body(...)):
+async def debug_search(body: dict = Body(...)):
     """Debug endpoint to test search components separately"""
     try:
         question = body.get("question", "test")
         print(f"Debug search for: {question}")
         
-        # Test vector search
-        qvec = get_question_embedding(question)
+        # Test vector search (await the async function)
+        qvec = await get_question_embedding(question)
 
         # Test hybrid
         hybrid_results = hybrid_candidates(question, qvec, DEFAULT_LABELS, k_vec=5, k_kw=5)
