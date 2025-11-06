@@ -268,51 +268,57 @@ def _fulltext_query_string(terms: List[str]) -> str:
 def fulltext_search(question: str, limit: int = 12, labels: Optional[List[str]] = None) -> List[Tuple[Any, float]]:
     """BM25 full-text search using Neo4j full-text index, anchored on key phrases."""
     labels = labels or DEFAULT_LABELS
-    with driver.session() as s:
-        _ensure_fulltext_index(s, labels)
-        anchors = _anchor_terms(question, max_terms=3)
-        kws     = _extract_keywords(question, max_terms=8)
-        terms: List[str] = []
-        seen = set()
-        for t in anchors + kws:
-            t = (t or "").strip()
-            if not t:
-                continue
-            if t.lower() in seen:
-                continue
-            terms.append(t)
-            seen.add(t.lower())
+    try:
+        with driver.session() as s:
+            _ensure_fulltext_index(s, labels)
+            anchors = _anchor_terms(question, max_terms=3)
+            kws     = _extract_keywords(question, max_terms=8)
+            terms: List[str] = []
+            seen = set()
+            for t in anchors + kws:
+                t = (t or "").strip()
+                if not t:
+                    continue
+                if t.lower() in seen:
+                    continue
+                terms.append(t)
+                seen.add(t.lower())
 
-        q = _fulltext_query_string(terms)
-        if not q:
-            return []
+            q = _fulltext_query_string(terms)
+            if not q:
+                return []
 
-        lim = max(limit, 16)
+            lim = max(limit, 16)
 
-        res = s.run(
-            """
-            CALL db.index.fulltext.queryNodes($name, $q, {limit: $lim})
-            YIELD node, score
-            RETURN node, score
-            """,
-            name=FTS_NAME, q=q, lim=lim
-        )
-        hits = [(r["node"], float(r["score"])) for r in res]
+            res = s.run(
+                """
+                CALL db.index.fulltext.queryNodes($name, $q, {limit: $lim})
+                YIELD node, score
+                RETURN node, score
+                """,
+                name=FTS_NAME, q=q, lim=lim
+            )
+            hits = [(r["node"], float(r["score"])) for r in res]
 
-        if not hits and anchors:
-            aq = _fulltext_query_string(anchors[:1])
-            if aq:
-                res2 = s.run(
-                    """
-                    CALL db.index.fulltext.queryNodes($name, $q, {limit: $lim})
-                    YIELD node, score
-                    RETURN node, score
-                    """,
-                    name=FTS_NAME, q=aq, lim=lim
-                )
-                hits = [(r["node"], float(r["score"])) for r in res2]
+            if not hits and anchors:
+                aq = _fulltext_query_string(anchors[:1])
+                if aq:
+                    res2 = s.run(
+                        """
+                        CALL db.index.fulltext.queryNodes($name, $q, {limit: $lim})
+                        YIELD node, score
+                        RETURN node, score
+                        """,
+                        name=FTS_NAME, q=aq, lim=lim
+                    )
+                    hits = [(r["node"], float(r["score"])) for r in res2]
 
-        return hits[:limit]
+            return hits[:limit]
+    except Exception as e:
+        print(f"ERROR in fulltext_search: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 # =========================
 # Vector search (base)
@@ -506,27 +512,59 @@ def traverse_neighbors(seed_element_ids: List[str],
     Expand neighborhood around seeds. Uses APOC if present; otherwise pure Cypher.
     Neo4j 5 compatible.
     """
-    with driver.session() as s:
-        try:
-            apoc_ok = s.run("""
-                SHOW PROCEDURES YIELD name
-                WHERE name = 'apoc.path.expandConfig'
-                RETURN count(*) AS c
-            """).single()["c"] > 0
-        except Exception:
-            apoc_ok = False
+    if not seed_element_ids:
+        return {"nodes": [], "rels": []}
+    
+    try:
+        with driver.session() as s:
+            try:
+                apoc_ok = s.run("""
+                    SHOW PROCEDURES YIELD name
+                    WHERE name = 'apoc.path.expandConfig'
+                    RETURN count(*) AS c
+                """).single()["c"] > 0
+            except Exception:
+                apoc_ok = False
 
-        if apoc_ok:
+            if apoc_ok:
+                q = """
+                MATCH (n)
+                WHERE elementId(n) IN $ids
+                CALL apoc.path.expandConfig(n, {
+                  minLevel: 1,
+                  maxLevel: $hops,
+                  uniqueness: "NODE_GLOBAL",
+                  bfs: true
+                }) YIELD path
+                WITH collect(path) AS paths
+                UNWIND paths AS p
+                WITH collect(nodes(p)) AS nlists, collect(relationships(p)) AS rlists
+                UNWIND nlists AS nl
+                UNWIND nl AS n
+                WITH collect(DISTINCT n) AS ns, rlists
+                UNWIND rlists AS rl
+                UNWIND rl AS r
+                WITH ns, collect(DISTINCT r) AS rs2
+                RETURN
+                  [x IN ns | {props: properties(x), labels: labels(x), id: elementId(x)}] AS nodes,
+                  [r IN rs2 | {
+                      type: type(r),
+                      props: properties(r),
+                      start: elementId(startNode(r)),
+                      end: elementId(endNode(r))
+                  }] AS rels
+                """
+                rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
+                if rec is None:
+                    return {"nodes": [], "rels": []}
+                return {"nodes": rec["nodes"] or [], "rels": rec["rels"] or []}
+
+            # ---------- Pure Cypher fallback (no APOC at all) ----------
             q = """
             MATCH (n)
             WHERE elementId(n) IN $ids
-            CALL apoc.path.expandConfig(n, {
-              minLevel: 1,
-              maxLevel: $hops,
-              uniqueness: "NODE_GLOBAL",
-              bfs: true
-            }) YIELD path
-            WITH collect(path) AS paths
+            MATCH p=(n)-[*1..$hops]-(m)
+            WITH collect(p) AS paths
             UNWIND paths AS p
             WITH collect(nodes(p)) AS nlists, collect(relationships(p)) AS rlists
             UNWIND nlists AS nl
@@ -545,33 +583,15 @@ def traverse_neighbors(seed_element_ids: List[str],
               }] AS rels
             """
             rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
-            return {"nodes": rec["nodes"], "rels": rec["rels"]}
-
-        # ---------- Pure Cypher fallback (no APOC at all) ----------
-        q = """
-        MATCH (n)
-        WHERE elementId(n) IN $ids
-        MATCH p=(n)-[*1..$hops]-(m)
-        WITH collect(p) AS paths
-        UNWIND paths AS p
-        WITH collect(nodes(p)) AS nlists, collect(relationships(p)) AS rlists
-        UNWIND nlists AS nl
-        UNWIND nl AS n
-        WITH collect(DISTINCT n) AS ns, rlists
-        UNWIND rlists AS rl
-        UNWIND rl AS r
-        WITH ns, collect(DISTINCT r) AS rs2
-        RETURN
-          [x IN ns | {props: properties(x), labels: labels(x), id: elementId(x)}] AS nodes,
-          [r IN rs2 | {
-              type: type(r),
-              props: properties(r),
-              start: elementId(startNode(r)),
-              end: elementId(endNode(r))
-          }] AS rels
-        """
-        rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
-        return {"nodes": rec["nodes"], "rels": rec["rels"]}
+            if rec is None:
+                return {"nodes": [], "rels": []}
+            return {"nodes": rec["nodes"] or [], "rels": rec["rels"] or []}
+    except Exception as e:
+        print(f"ERROR in traverse_neighbors: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return empty result instead of crashing
+        return {"nodes": [], "rels": []}
 
 # --------- Dedup helpers ---------
 _NUM_WORDS = {

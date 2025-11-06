@@ -202,6 +202,9 @@ def shutdown_event():
 
 @app.post("/graphrag")
 async def graphrag(body: RagBody = Body(...), request: Request = None):  # async + Request
+    request_id = id(request)  # Simple request tracking
+    print(f"[REQ-{request_id}] Starting graphrag request")
+    
     try:
         if not body.question.strip():
             return {"success": False, "message": "Please provide a question.", "answer": "", "facts": "", "seeds": []}
@@ -213,11 +216,13 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         labels = body.labels or DEFAULT_LABELS
 
         # 1) Embed question (AWAIT)
+        print(f"[REQ-{request_id}] Step 1: Embedding question")
         t = perf_counter()
         qvec = await get_question_embedding(q0, request=request)
         timings["embed"] = perf_counter() - t
 
         # 2) Hybrid candidates (vector + keyword)
+        print(f"[REQ-{request_id}] Step 2: Hybrid candidates search")
         t = perf_counter()
         cands = hybrid_candidates(
             question=q0, qvec=qvec, labels=labels,
@@ -225,6 +230,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
             alpha_vec=body.alpha_vec, beta_kw=body.beta_kw
         )
         timings["hybrid"] = perf_counter() - t
+        print(f"[REQ-{request_id}] Found {len(cands)} candidates")
 
         # 3) Early "no data" check
         if not cands:
@@ -263,6 +269,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
             timings["cross_doc"] = perf_counter() - t
 
         # 6) Expand neighbors
+        print(f"[REQ-{request_id}] Step 6: Expanding neighbors")
         t = perf_counter()
         raw_seed_ids = [n.element_id for n, _ in cands]
         with driver.session() as s:
@@ -289,8 +296,10 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
             max_hops=max(1, min(body.hops, 3))
         )
         timings["graph_traverse"] = perf_counter() - t
+        print(f"[REQ-{request_id}] Traversed graph, found {len(expanded)} nodes")
 
         # 7) Format context
+        print(f"[REQ-{request_id}] Step 7: Formatting context")
         t = perf_counter()
         facts = format_graph_context(expanded, max_lines=None, snippet_chars=None, include_source=True)
         timings["format_context"] = perf_counter() - t
@@ -327,6 +336,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         ]
 
         timings["total"] = perf_counter() - t_total
+        print(f"[REQ-{request_id}] Completed successfully in {timings['total']:.3f}s")
         print(f"[TIMINGS] {timings}")
 
         return {
@@ -356,14 +366,23 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         return {
             "success": False, 
             "message": "Database temporarily unavailable. Please try again.",
-            "error_type": "connection"
+            "error_type": "connection",
+            "error_details": str(e) if str(e) else repr(e)
         }
     except Exception as e:
-        # Log server-side
-        print(f"graphrag error: {e}")
+        # Log server-side with more details
+        error_type = type(e).__name__
+        error_message = str(e) if str(e) else repr(e)
+        print(f"graphrag error [{error_type}]: {error_message}")
         import traceback
-        traceback.print_exc()
-        return {"success": False, "message": f"Query failed. No knowledge able to be retrieved. Error: {str(e)}"}
+        full_traceback = traceback.format_exc()
+        print(f"Full traceback:\n{full_traceback}")
+        return {
+            "success": False, 
+            "message": f"Query failed. No knowledge able to be retrieved. Error: {error_message}",
+            "error_type": error_type,
+            "error_details": error_message
+        }
     
 @app.post("/debug-search")
 def debug_search(body: dict = Body(...)):
