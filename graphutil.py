@@ -42,7 +42,8 @@ async def init_clients():
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             },
-            timeout=10.0
+            timeout=httpx.Timeout(30.0, connect=10.0),  # Increased from 10s, separate connect timeout
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)  # Connection pooling
         )
 
     CHAT_MODEL = _openai["chat_deployment"]
@@ -77,15 +78,27 @@ def _get_providers():
 # ===============================
 # Embedding Functions
 # ===============================
-def _azure_embed(text: str) -> List[float]:
-    """Sync embedding call to Azure OpenAI."""
+def _azure_embed(text: str, max_retries: int = 3) -> List[float]:
+    """Sync embedding call to Azure OpenAI with retry logic."""
     print("[DEBUG] >>> Using Azure sync embedding path")
-    resp = client.embeddings.create(input=[text], model=_openai["embedding_deployment"])
-    return resp.data[0].embedding
+    
+    for attempt in range(max_retries):
+        try:
+            resp = client.embeddings.create(input=[text], model=_openai["embedding_deployment"])
+            return resp.data[0].embedding
+        except Exception as e:
+            error_name = type(e).__name__
+            if attempt < max_retries - 1:
+                wait_time = 0.5 * (2 ** attempt)  # Exponential backoff
+                print(f"[AZURE-EMBED-RETRY] Attempt {attempt + 1}/{max_retries} failed with {error_name}: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"[AZURE-EMBED-ERROR] All {max_retries} attempts failed: {error_name}: {e}")
+                raise
 
 
-async def _sains_vllm_embed(text: str, request=None) -> List[float]:
-    """Async embedding call to vLLM server (diagnostic timing)."""
+async def _sains_vllm_embed(text: str, request=None, max_retries: int = 3) -> List[float]:
+    """Async embedding call to vLLM server with retry logic."""
     print("[DEBUG] >>> Using vLLM async embedding path")
     _, _cfg, _ = _get_providers()
     sains_cfg = _cfg.get("sains_vllm", {})
@@ -96,23 +109,57 @@ async def _sains_vllm_embed(text: str, request=None) -> List[float]:
 
     payload = {"model": model, "input": [text]}
 
-    t0 = time.perf_counter()
-    resp = await session.post(f"{base_url}/embeddings", json=payload)
+    for attempt in range(max_retries):
+        try:
+            t0 = time.perf_counter()
+            resp = await session.post(f"{base_url}/embeddings", json=payload)
+            t1 = time.perf_counter()
+            print(f"[DEBUG] <<< vLLM call took {t1 - t0:.3f}s")
+
+            resp.raise_for_status()
+            data = resp.json()
+            return data["data"][0]["embedding"]
+        except Exception as e:
+            error_name = type(e).__name__
+            if attempt < max_retries - 1:
+                wait_time = 0.5 * (2 ** attempt)
+                print(f"[VLLM-EMBED-RETRY] Attempt {attempt + 1}/{max_retries} failed with {error_name}: {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"            else:
+                print(f"[VLLM-EMBED-ERROR] All {max_retries} attempts failed: {error_name}: {e}")
+                raise
+
+
+async def get_question_embedding(question: str, request=None, max_retries: int = 3) -> List[float]:")
+                raise
     elapsed = time.perf_counter() - t0
     print(f"[DEBUG] Embedding HTTP call took {elapsed:.3f}s, status={resp.status_code}")
     resp.raise_for_status()
     return resp.json()["data"][0]["embedding"]
 
 
-async def get_question_embedding(question: str, request=None) -> List[float]:
-    """Return embedding, async for vLLM."""
+async def get_question_embedding(question: str, request=None, max_retries: int = 3) -> List[float]:
+    """Return embedding with retry logic for connection errors."""
     provider, *_ = _get_providers()
     print(provider)
-    if provider == "sains_vllm":
-        print("Hi")
-        return await _sains_vllm_embed(question, request=request)
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _azure_embed, question)
+    
+    for attempt in range(max_retries):
+        try:
+            if provider == "sains_vllm":
+                print("Hi")
+                return await _sains_vllm_embed(question, request=request)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, _azure_embed, question)
+        except Exception as e:
+            error_name = type(e).__name__
+            if attempt < max_retries - 1:
+                wait_time = 0.5 * (2 ** attempt)  # Exponential backoff: 0.5s, 1s, 2s
+                print(f"[EMBED-RETRY] Attempt {attempt + 1}/{max_retries} failed with {error_name}: {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"[EMBED-ERROR] All {max_retries} attempts failed: {error_name}: {e}")
+                raise  # Re-raise after all retries exhausted
 
 
 # ===============================
