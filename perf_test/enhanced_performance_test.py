@@ -46,31 +46,33 @@ class TestConfig:
     API_URL = "https://knowledge-graph.sains.com.my/graphrag"
     QUEUE_STATUS_URL = "https://knowledge-graph.sains.com.my/queue_status"
     
-    # Load test parameters
-    # For quick testing around queue capacity (20 concurrent):
-    MIN_USERS = 15           # Start at 15 users
-    MAX_USERS = 30           # Test up to 30 users
-    USERS_INCREMENT = 5      # Jump by 5 users: 15, 20, 25, 30
+    # Output configuration
+    OUTPUT_DIR = Path("test_results")  # Directory to save test results
+    
+    # Load test parameters - Find breaking point mode
+    MIN_USERS = 10           # Start at 10 users
+    MAX_USERS = 200          # Test up to 200 users (will stop early if API dies)
+    USERS_INCREMENT = 5      # Jump by 5 users
     WAIT_BETWEEN_STEPS = 3   # Seconds to wait between load steps
     
-    # For thorough testing (slower):
-    # MIN_USERS = 1
-    # MAX_USERS = 50
-    # USERS_INCREMENT = 1
-    # WAIT_BETWEEN_STEPS = 2
+    # Breaking point detection
+    FAILURE_THRESHOLD = 50   # Stop if failure rate exceeds 50%
+    CONSECUTIVE_FAILURES = 2 # Stop after 2 consecutive high-failure steps
+    MIN_SUCCESS_RATE = 50    # Minimum acceptable success rate (%)
     
     # Request parameters
     REQUEST_TIMEOUT = 400  # seconds
     MAX_RETRIES = 3
     RETRY_DELAY = 2  # seconds
     
-    # Success criteria
+    # Success criteria (deprecated - using FAILURE_THRESHOLD now)
     MAX_ACCEPTABLE_LATENCY_MS = 30000  # 30 seconds
-    MAX_ACCEPTABLE_FAIL_RATE = 10  # percent
+    MAX_ACCEPTABLE_FAIL_RATE = 50  # Use FAILURE_THRESHOLD instead
     
-    # Output
-    OUTPUT_DIR = Path("test_results")
-    ENABLE_CHARTS = True  # Generate charts in Excel
+    # DEBUGGING OPTIONS
+    DEBUG_MODE = True       # Enable detailed logging
+    LOG_REQUEST_TIMING = True  # Log when each request starts/ends
+    MONITOR_QUEUE_CONTINUOUSLY = True  # Check queue during test
 
 
 # Test questions
@@ -118,6 +120,9 @@ class RequestResult:
     error_message: str
     retry_count: int
     queue_position: Optional[int]
+    request_start_time: Optional[float] = None  # NEW: Track when request actually started
+    request_end_time: Optional[float] = None    # NEW: Track when request ended
+    barrier_wait_time_ms: Optional[float] = None  # NEW: How long thread waited at barrier
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -142,6 +147,9 @@ class StepMetrics:
     throughput_rps: float
     duration_seconds: float
     errors: Dict[str, int]
+    # NEW: Concurrency verification
+    barrier_wait_time_ms: Optional[float] = None
+    actual_concurrent_starts: int = 0  # How many requests started within 100ms of each other
     
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -181,13 +189,29 @@ class GraphRAGClient:
         """Send a single GraphRAG request with retry logic"""
         
         # Wait for all threads to be ready before starting (for true concurrency)
+        barrier_wait_start = time.time()
         if start_barrier:
             try:
+                if self.config.DEBUG_MODE:
+                    if RICH_AVAILABLE:
+                        console.print(f"[dim blue]User {user_index}: Waiting at barrier...[/dim blue]")
+                    else:
+                        print(f"User {user_index}: Waiting at barrier...")
                 start_barrier.wait(timeout=30)
             except threading.BrokenBarrierError:
                 pass
+        barrier_wait_time = (time.time() - barrier_wait_start) * 1000
         
-        start_time = time.time()
+        # RECORD THE EXACT START TIME
+        request_start_time = time.time()
+        
+        if self.config.DEBUG_MODE and self.config.LOG_REQUEST_TIMING:
+            timestamp_str = datetime.fromtimestamp(request_start_time).strftime("%H:%M:%S.%f")[:-3]
+            if RICH_AVAILABLE:
+                console.print(f"[bright_blue]🚀 User {user_index}: Request STARTED at {timestamp_str}[/bright_blue]")
+            else:
+                print(f"🚀 User {user_index}: Request STARTED at {timestamp_str}")
+        
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
         
         result = RequestResult(
@@ -203,7 +227,10 @@ class GraphRAGClient:
             success=False,
             error_message="",
             retry_count=0,
-            queue_position=None
+            queue_position=None,
+            request_start_time=request_start_time,
+            request_end_time=None,
+            barrier_wait_time_ms=barrier_wait_time
         )
         
         headers = {"Content-Type": "application/json"}
@@ -218,7 +245,7 @@ class GraphRAGClient:
                     timeout=self.config.REQUEST_TIMEOUT
                 )
                 
-                response_time_ms = (time.time() - start_time) * 1000
+                response_time_ms = (time.time() - request_start_time) * 1000
                 result.response_time_ms = response_time_ms
                 result.status_code = response.status_code
                 result.retry_count = attempt
@@ -238,22 +265,26 @@ class GraphRAGClient:
                             timings = data.get("timings", {})
                             if timings:
                                 result.ttft_ms = timings.get("embed", None)
+                            result.request_end_time = time.time()
                             return result
                         else:
                             # API returned success: false
                             result.status = "api_failure"
                             result.error_message = data.get("message") or data.get("error_details") or "API returned success: false"
+                            result.request_end_time = time.time()
                             # Don't retry API failures - they're likely valid "no data" responses
                             return result
                     except json.JSONDecodeError:
                         result.status = "invalid_json"
                         result.error_message = f"Invalid JSON response: {response.text[:200]}"
+                        result.request_end_time = time.time()
                         return result
                 else:
                     # HTTP error
                     result.status = "http_error"
                     result.error_message = f"HTTP {response.status_code}: {response.text[:100]}"
                     result.latency_ms = response_time_ms
+                    result.request_end_time = time.time()
                     
                 # If not successful and we have retries left, try again
                 if attempt < self.config.MAX_RETRIES - 1:
@@ -266,6 +297,7 @@ class GraphRAGClient:
                 result.status = "timeout"
                 result.error_message = f"Request timeout after {self.config.REQUEST_TIMEOUT}s"
                 result.retry_count = attempt
+                result.request_end_time = time.time()
                 if attempt < self.config.MAX_RETRIES - 1:
                     time.sleep(self.config.RETRY_DELAY * (attempt + 1))
                     continue
@@ -275,6 +307,7 @@ class GraphRAGClient:
                 result.status = "connection_error"
                 result.error_message = f"Connection error: {str(e)[:100]}"
                 result.retry_count = attempt
+                result.request_end_time = time.time()
                 if attempt < self.config.MAX_RETRIES - 1:
                     time.sleep(self.config.RETRY_DELAY * (2 ** attempt))
                     continue
@@ -284,6 +317,7 @@ class GraphRAGClient:
                 result.status = "error"
                 result.error_message = f"Unexpected error: {str(e)[:100]}"
                 result.retry_count = attempt
+                result.request_end_time = time.time()
                 return result
         
         return result
@@ -305,6 +339,9 @@ class LoadTestExecutor:
         self.client = GraphRAGClient(config)
         self.all_results: List[RequestResult] = []
         self.step_metrics: List[StepMetrics] = []
+        self.consecutive_high_failures = 0  # Track consecutive failure steps
+        self.breaking_point_found = False
+        self.breaking_point_users = None
         
     def run_concurrent_requests(self, num_users: int, step: int) -> List[RequestResult]:
         """Run multiple TRULY CONCURRENT requests using threading barrier"""
@@ -394,7 +431,7 @@ class LoadTestExecutor:
         set_start_time_func()
         
         # Now all threads fire at once!
-        return self.client.send_request(question, step, user_idx, None)
+        return self.client.send_request(question, step, user_idx, start_barrier)
     
     def calculate_step_metrics(self, results: List[RequestResult], step: int, duration: float) -> StepMetrics:
         """Calculate aggregated metrics for a step"""
@@ -429,6 +466,18 @@ class LoadTestExecutor:
         # Throughput
         throughput = total / duration if duration > 0 else 0
         
+        # DEBUGGING: Calculate concurrency metrics
+        barrier_wait_times = [r.barrier_wait_time_ms for r in results if r.barrier_wait_time_ms is not None]
+        avg_barrier_wait = statistics.mean(barrier_wait_times) if barrier_wait_times else 0
+        
+        # Count how many requests actually started within 100ms of each other (true concurrency)
+        start_times = [r.request_start_time for r in results if r.request_start_time is not None]
+        if start_times:
+            min_start = min(start_times)
+            actual_concurrent_starts = sum(1 for t in start_times if t - min_start <= 0.1)  # Within 100ms
+        else:
+            actual_concurrent_starts = 0
+        
         return StepMetrics(
             step=step,
             concurrent_users=len(set(r.user_index for r in results)),
@@ -445,22 +494,25 @@ class LoadTestExecutor:
             max_latency_ms=max_latency,
             throughput_rps=throughput,
             duration_seconds=duration,
-            errors=errors
+            errors=errors,
+            barrier_wait_time_ms=avg_barrier_wait,
+            actual_concurrent_starts=actual_concurrent_starts
         )
     
     def run_test(self):
-        """Run the complete incremental load test"""
+        """Run the complete incremental load test to find breaking point"""
         if RICH_AVAILABLE:
-            console.print("\n[bold cyan]🚀 Starting Enhanced GraphRAG Performance Test[/bold cyan]\n")
+            console.print("\n[bold cyan]🚀 Starting Breaking Point Detection Test[/bold cyan]\n")
             console.print(f"[cyan]Configuration:[/cyan]")
             console.print(f"  • Users: {self.config.MIN_USERS} → {self.config.MAX_USERS} (increment: {self.config.USERS_INCREMENT})")
             console.print(f"  • API: {self.config.API_URL}")
-            console.print(f"  • Timeout: {self.config.REQUEST_TIMEOUT}s")
-            console.print(f"  • Max Retries: {self.config.MAX_RETRIES}\n")
+            console.print(f"  • Failure Threshold: {self.config.FAILURE_THRESHOLD}%")
+            console.print(f"  • Stop after {self.config.CONSECUTIVE_FAILURES} consecutive high-failure steps\n")
         else:
-            print("\n🚀 Starting Enhanced GraphRAG Performance Test\n")
+            print("\n🚀 Starting Breaking Point Detection Test\n")
             print(f"Users: {self.config.MIN_USERS} → {self.config.MAX_USERS}")
-            print(f"API: {self.config.API_URL}\n")
+            print(f"API: {self.config.API_URL}")
+            print(f"Failure Threshold: {self.config.FAILURE_THRESHOLD}%\n")
         
         # Check initial queue status
         queue_status = self.client.get_queue_status()
@@ -506,12 +558,17 @@ class LoadTestExecutor:
                 # Display step results
                 self._display_step_results(metrics)
                 
-                # Check if we should stop
-                if self._should_stop_test(metrics):
+                # Check for breaking point
+                stop_reason = self._check_breaking_point(metrics)
+                if stop_reason:
                     if RICH_AVAILABLE:
-                        console.print(f"\n[bold red]⚠️  Stopping test: Fail rate ({metrics.fail_rate:.1f}%) exceeds threshold ({self.config.MAX_ACCEPTABLE_FAIL_RATE}%)[/bold red]")
+                        console.print(f"\n[bold red]🛑 {stop_reason}[/bold red]")
+                        console.print(f"[bold yellow]Breaking point: {metrics.concurrent_users} concurrent users[/bold yellow]")
                     else:
-                        print(f"\n⚠️  Stopping test: Fail rate too high")
+                        print(f"\n🛑 {stop_reason}")
+                        print(f"Breaking point: {metrics.concurrent_users} concurrent users")
+                    self.breaking_point_found = True
+                    self.breaking_point_users = metrics.concurrent_users
                     break
                 
                 # Wait before next step
@@ -549,6 +606,13 @@ class LoadTestExecutor:
             table.add_row("P95 Latency", f"{metrics.p95_latency_ms:.0f} ms")
             table.add_row("Throughput", f"{metrics.throughput_rps:.2f} req/s")
             
+            # DEBUGGING: Show concurrency verification
+            if hasattr(metrics, 'barrier_wait_time_ms') and metrics.barrier_wait_time_ms > 0:
+                table.add_row("Barrier Wait Time", f"{metrics.barrier_wait_time_ms:.1f} ms")
+            if hasattr(metrics, 'actual_concurrent_starts') and metrics.actual_concurrent_starts > 0:
+                concurrent_pct = (metrics.actual_concurrent_starts / metrics.total_requests * 100) if metrics.total_requests > 0 else 0
+                table.add_row("True Concurrent Starts", f"{metrics.actual_concurrent_starts}/{metrics.total_requests} ({concurrent_pct:.1f}%)")
+            
             # Show error breakdown if there are errors
             if metrics.errors:
                 table.add_row("", "")
@@ -564,11 +628,43 @@ class LoadTestExecutor:
             print(f"  Avg Latency: {metrics.avg_latency_ms:.0f}ms | P95: {metrics.p95_latency_ms:.0f}ms | "
                   f"Throughput: {metrics.throughput_rps:.2f} req/s")
             
+            # DEBUGGING: Show concurrency verification
+            if hasattr(metrics, 'barrier_wait_time_ms') and metrics.barrier_wait_time_ms > 0:
+                print(f"  Barrier Wait Time: {metrics.barrier_wait_time_ms:.1f}ms")
+            if hasattr(metrics, 'actual_concurrent_starts') and metrics.actual_concurrent_starts > 0:
+                concurrent_pct = (metrics.actual_concurrent_starts / metrics.total_requests * 100) if metrics.total_requests > 0 else 0
+                print(f"  True Concurrent Starts: {metrics.actual_concurrent_starts}/{metrics.total_requests} ({concurrent_pct:.1f}%)")
+            
             # Show errors
             if metrics.errors:
                 print(f"  Errors:")
                 for error, count in list(metrics.errors.items())[:5]:
                     print(f"    • {error[:60]}: {count}x")
+    
+    def _check_breaking_point(self, metrics: StepMetrics) -> Optional[str]:
+        """Check if we've reached the API breaking point"""
+        
+        # Check if failure rate exceeds threshold
+        if metrics.fail_rate >= self.config.FAILURE_THRESHOLD:
+            self.consecutive_high_failures += 1
+            
+            if self.consecutive_high_failures >= self.config.CONSECUTIVE_FAILURES:
+                return f"API Breaking Point Detected: {self.config.CONSECUTIVE_FAILURES} consecutive steps with >{self.config.FAILURE_THRESHOLD}% failure rate"
+        else:
+            # Reset counter if we get a good step
+            self.consecutive_high_failures = 0
+        
+        # Check for complete API death (all connection errors or timeouts)
+        connection_errors = sum(1 for r in self.all_results[-metrics.total_requests:] 
+                               if r.status in ["connection_error", "timeout"])
+        if connection_errors >= metrics.total_requests * 0.8:  # 80% connection/timeout errors
+            return f"API Appears Dead: {connection_errors}/{metrics.total_requests} requests failed with connection/timeout errors"
+        
+        # Check for catastrophic failure rate
+        if metrics.fail_rate >= 80:
+            return f"Catastrophic Failure: {metrics.fail_rate:.1f}% failure rate"
+        
+        return None
     
     def _should_stop_test(self, metrics: StepMetrics) -> bool:
         """Check if test should stop based on metrics"""
@@ -578,6 +674,12 @@ class LoadTestExecutor:
         """Display final test summary"""
         if RICH_AVAILABLE:
             console.print("\n[bold cyan]📈 Test Summary[/bold cyan]\n")
+            
+            # Show breaking point if found
+            if self.breaking_point_found:
+                console.print(f"[bold red]🎯 API Breaking Point: {self.breaking_point_users} concurrent users[/bold red]\n")
+            else:
+                console.print(f"[bold green]✓ API handled up to {self.step_metrics[-1].concurrent_users} concurrent users without breaking[/bold green]\n")
             
             table = Table(title="Performance Metrics by Load Step")
             table.add_column("Step", style="cyan", justify="right")
@@ -633,6 +735,13 @@ class LoadTestExecutor:
             
         else:
             print("\n📈 Test Summary\n")
+            
+            # Show breaking point if found
+            if self.breaking_point_found:
+                print(f"🎯 API Breaking Point: {self.breaking_point_users} concurrent users\n")
+            else:
+                print(f"✓ API handled up to {self.step_metrics[-1].concurrent_users} concurrent users without breaking\n")
+            
             for m in self.step_metrics:
                 print(f"Step {m.step} ({m.concurrent_users} users): "
                       f"{m.successful_requests}/{m.total_requests} success ({m.success_rate:.1f}%), "
@@ -662,7 +771,8 @@ class LoadTestExecutor:
         
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = self.config.OUTPUT_DIR / f"graphrag_performance_test_{timestamp}.xlsx"
+        breaking_point_suffix = f"_bp{self.breaking_point_users}" if self.breaking_point_found else "_no_bp"
+        filename = self.config.OUTPUT_DIR / f"graphrag_performance_test_{timestamp}{breaking_point_suffix}.xlsx"
         
         try:
             with pd.ExcelWriter(filename, engine="openpyxl") as writer:
@@ -719,6 +829,8 @@ class LoadTestExecutor:
             "p99_latency_ms": statistics.quantiles(latencies, n=100)[98] if len(latencies) > 1 else (latencies[0] if latencies else 0),
             "total_steps": len(self.step_metrics),
             "max_concurrent_users_tested": max((m.concurrent_users for m in self.step_metrics), default=0),
+            "breaking_point_found": self.breaking_point_found,
+            "breaking_point_users": self.breaking_point_users if self.breaking_point_found else "N/A",
         }
 
 

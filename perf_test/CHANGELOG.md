@@ -1,5 +1,41 @@
 # Changelog - Enhanced Performance Test
 
+## [2.1.0] - 2025-11-07
+
+### 🎯 Breaking Point Detection
+
+**New Feature:** Automatically find the maximum concurrent users API can handle before failure
+
+#### Detection Logic
+- **Failure Threshold:** Stop if fail rate exceeds 50% for 2 consecutive steps
+- **Connection Death:** Stop if 80%+ requests have connection/timeout errors
+- **Catastrophic Failure:** Stop if fail rate exceeds 80% in single step
+
+#### Configuration
+```python
+MIN_USERS = 10               # Start at 10 users
+MAX_USERS = 200              # Test up to 200 (stops early if breaking point found)
+USERS_INCREMENT = 5          # Jump by 5: 10, 15, 20, 25...
+FAILURE_THRESHOLD = 50       # % failure rate to trigger stop
+CONSECUTIVE_FAILURES = 2     # Number of high-failure steps before stopping
+```
+
+#### Output
+- **Console:** Shows breaking point when detected
+- **Excel Filename:** Includes breaking point (`_bp50` = broke at 50 users)
+- **Statistics Sheet:** Records breaking point found and user count
+- **Summary:** Highlights breaking point or max tested capacity
+
+#### Example Output
+```
+🎯 API Breaking Point: 45 concurrent users
+Step 8 (45 users): 15/45 success (33.3%), fail rate: 66.7%
+
+Result: graphrag_performance_test_20251107_143022_bp45.xlsx
+```
+
+---
+
 ## [2.0.0] - 2025-11-07
 
 ### 🔧 Critical Fixes
