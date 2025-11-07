@@ -1,5 +1,6 @@
 import time
 import re, os, uuid
+import asyncio
 from typing import List, Optional
 from fastapi import FastAPI, Body, UploadFile, Request
 from neo4j.exceptions import ServiceUnavailable
@@ -30,6 +31,12 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
+# Request queue management - limits concurrent processing to prevent API overload
+MAX_CONCURRENT_REQUESTS = 20  # Maximum concurrent requests to process
+request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+active_requests = 0
+queued_requests = 0
+
 # NEW: ensure embedding/chat clients are initialized at app startup
 @app.on_event("startup")
 async def _startup():
@@ -44,6 +51,17 @@ class RagBody(BaseModel):
     beta_kw: float = 0.4
     use_mmr: bool = True
     use_cross_doc: bool = True
+
+@app.get("/queue_status")
+async def get_queue_status():
+    """Get current queue status"""
+    return {
+        "success": True,
+        "active_requests": active_requests,
+        "queued_requests": queued_requests,
+        "max_concurrent": MAX_CONCURRENT_REQUESTS,
+        "available_slots": MAX_CONCURRENT_REQUESTS - active_requests
+    }
 
 @app.get("/test")
 def test():
@@ -201,10 +219,33 @@ def shutdown_event():
     print("✅ Neo4j driver closed")
 
 @app.post("/graphrag")
-async def graphrag(body: RagBody = Body(...), request: Request = None):  # async + Request
-    request_id = id(request)  # Simple request tracking
-    print(f"[REQ-{request_id}] Starting graphrag request")
+async def graphrag(body: RagBody = Body(...), request: Request = None):
+    global active_requests, queued_requests
     
+    request_id = id(request)
+    
+    # Increment queued counter
+    queued_requests += 1
+    queue_position = queued_requests
+    print(f"[REQ-{request_id}] Queued at position {queue_position}. Active: {active_requests}, Queued: {queued_requests}")
+    
+    # Acquire semaphore - this will block if max concurrent requests reached
+    async with request_semaphore:
+        # Now processing - update counters
+        queued_requests -= 1
+        active_requests += 1
+        print(f"[REQ-{request_id}] Starting processing (was at queue position {queue_position}). Active: {active_requests}, Queued: {queued_requests}")
+        
+        try:
+            result = await _process_graphrag(body, request_id, request)
+            return result
+        finally:
+            # Always decrement active counter
+            active_requests -= 1
+            print(f"[REQ-{request_id}] Completed. Active: {active_requests}, Queued: {queued_requests}")
+
+async def _process_graphrag(body: RagBody, request_id: int, request: Request):
+    """Internal function to process graphrag request"""
     try:
         if not body.question.strip():
             return {"success": False, "message": "Please provide a question.", "answer": "", "facts": "", "seeds": []}

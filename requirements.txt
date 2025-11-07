@@ -1,10 +1,17 @@
+# Core dependencies
 pyyaml
 neo4j
 openai>=1.37.0
 tiktoken
+
+# FastAPI web framework with async support for request queuing
 fastapi
 uvicorn[standard]
+python-multipart
+
+# Celery task queue with Redis backend
 celery[redis]
 redis
-python-multipart
+
+# WSGI server for production
 gunicorn
