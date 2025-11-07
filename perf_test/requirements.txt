@@ -1,5 +1,10 @@
+# Core dependencies for performance testing
 requests
 pandas
 openpyxl
-concurrent.futures
-slowapi
+
+# Optional but recommended for better console output
+rich
+
+# Note: concurrent.futures is built into Python 3.2+, no need to install
+# slowapi - only needed for Locust-based tests
