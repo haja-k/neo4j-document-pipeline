@@ -14,7 +14,7 @@ import random
 # CONFIG
 # ========================================
 
-API_KEY = "app-2coFsitSt2Up0L5X4ViZe06V"  # hybrid model
+API_KEY = " "  # hybrid model
 CHAT_ENDPOINT = "/v1/chat-messages"
 REQUEST_TIMEOUT = 120  # 2 minutes timeout instead of 400s
 
@@ -47,7 +47,7 @@ QUESTIONS = [
 ]
 
 class ChatUser(HttpUser):
-    host = "https://i-scs.sarawak.gov.my"
+    host = " " # replace URL
     wait_time = between(1, 3)  # Add small wait between requests per user
 
     def __init__(self, *args, **kwargs):
