@@ -10,7 +10,7 @@ import pandas as pd
 # CONFIG
 # ========================================
 
-API_URL = "https://knowledge-graph.sains.com.my/graphrag"
+API_URL = " " # replace URL
 HEADERS = {
     "Content-Type": "application/json",
 }
