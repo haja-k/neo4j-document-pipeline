@@ -43,8 +43,8 @@ except ImportError:
 
 class TestConfig:
     """Centralized test configuration"""
-    API_URL = "https://knowledge-graph.sains.com.my/graphrag"
-    QUEUE_STATUS_URL = "https://knowledge-graph.sains.com.my/queue_status"
+    API_URL = "https://knowledge-graph.com.my/graphrag" # replace URL
+    QUEUE_STATUS_URL = "https://knowledge-graph.com.my/queue_status" # replace URL
     
     # Output configuration
     OUTPUT_DIR = Path("test_results")  # Directory to save test results
