@@ -27,7 +27,7 @@ services:
     container_name: graphrag-api-dev  # Suffix for dev
     image: neo4j-api:v0.1
     environment:
-      NEO4J_URI: bolt://neo4j:7687  # Use service name for internal comms
+      NEO4J_URI: bolt://neo4j_dev:7687  # Use service name for internal comms
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: "12345678"
       DEBUG: true  # Enable debug mode (if your app supports it)
@@ -53,6 +53,20 @@ services:
     command: celery -A celery_app.celery worker --loglevel=info --concurrency=1  # Limit concurrency for dev
     depends_on:
       - redis
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'    # Use max 50% of a CPU core
+          memory: 512M    # Max 512MB of RAM
+        reservations:
+          cpus: '0.25'    # Guarantee 25% of a CPU core
+          memory: 256M    # Guarantee 256MB of RAM
+    environment:
+      - CELERYD_MAX_TASKS_PER_CHILD=10    # Restart worker after 10 tasks to prevent memory leaks
+      - CELERYD_TASK_SOFT_TIME_LIMIT=300  # 5 minute soft timeout
+      - CELERYD_TASK_TIME_LIMIT=360       # 6 minute hard timeout
+      - CELERY_ACKS_LATE=True             # Only acknowledge tasks after they complete
+      - CELERY_PREFETCH_MULTIPLIER=1      # Fetch one task at a time
     volumes:
       - .:/app  # Mount for hot-reloading in dev
     networks:

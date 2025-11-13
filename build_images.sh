@@ -9,7 +9,7 @@ docker pull neo4j:5
 
 # Build your API image
 echo "➡️  Building neo4j-api:v0.1 image..."
-docker build -t neo4j-api:v0.1 .
+docker build --no-cache -t neo4j-api:v0.1 .
 
 echo "✅ Build complete!"
 echo "You can now run: docker-compose up -d --build"
