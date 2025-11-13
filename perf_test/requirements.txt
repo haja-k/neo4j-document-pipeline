@@ -1,4 +1,10 @@
-requests>=2.25.0
-pandas>=1.3.0
-openpyxl>=3.0.0
-locust>=2.0.0
+# Core dependencies for performance testing
+requests
+pandas
+openpyxl
+
+# Optional but recommended for better console output
+rich
+
+# Note: concurrent.futures is built into Python 3.2+, no need to install
+# slowapi - only needed for Locust-based tests

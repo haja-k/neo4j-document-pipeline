@@ -1,5 +1,6 @@
 import time
 import re, os, uuid
+import asyncio
 from typing import List, Optional
 from fastapi import FastAPI, Body, UploadFile, Request
 from neo4j.exceptions import ServiceUnavailable
@@ -7,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from tasks import ingest_markdown_task
 from pydantic import BaseModel, Field
 from time import perf_counter
-from neo4j_connect import driver
+from neo4j_connect import driver, close_driver
 from graphutil import (
     init_clients,
     get_question_embedding,
@@ -30,6 +31,12 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
+# Request queue management - limits concurrent processing to prevent API overload
+MAX_CONCURRENT_REQUESTS = 20  # Maximum concurrent requests to process
+request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+active_requests = 0
+queued_requests = 0
+
 # NEW: ensure embedding/chat clients are initialized at app startup
 @app.on_event("startup")
 async def _startup():
@@ -44,6 +51,17 @@ class RagBody(BaseModel):
     beta_kw: float = 0.4
     use_mmr: bool = True
     use_cross_doc: bool = True
+
+@app.get("/queue_status")
+async def get_queue_status():
+    """Get current queue status"""
+    return {
+        "success": True,
+        "active_requests": active_requests,
+        "queued_requests": queued_requests,
+        "max_concurrent": MAX_CONCURRENT_REQUESTS,
+        "available_slots": MAX_CONCURRENT_REQUESTS - active_requests
+    }
 
 @app.get("/test")
 def test():
@@ -137,7 +155,7 @@ def drop_all_nodes(confirmation: bool = Body(False)):
         }
     
 @app.on_event("startup")
-def verify_embedding_system():
+async def verify_embedding_system():
     """Verify embedding system with retry logic for Neo4j connection"""
     max_retries = 10
     retry_delay = 5  # seconds
@@ -154,8 +172,8 @@ def verify_embedding_system():
                 if result.single()["test"] == 1:
                     print("✅ Neo4j connection successful")
             
-            # Test embedding generation
-            test_embedding = get_question_embedding("test question")
+            # Test embedding generation (await the async function)
+            test_embedding = await get_question_embedding("test question")
             actual_dimensions = len(test_embedding)
             print(f"🔍 Embedding system: {actual_dimensions} dimensions")
             
@@ -194,8 +212,40 @@ def verify_embedding_system():
             print(f"❌ Verification failed: {e}")
             break
 
+@app.on_event("shutdown")
+def shutdown_event():
+    """Close Neo4j driver on shutdown"""
+    close_driver()
+    print("✅ Neo4j driver closed")
+
 @app.post("/graphrag")
-async def graphrag(body: RagBody = Body(...), request: Request = None):  # async + Request
+async def graphrag(body: RagBody = Body(...), request: Request = None):
+    global active_requests, queued_requests
+    
+    request_id = id(request)
+    
+    # Increment queued counter
+    queued_requests += 1
+    queue_position = queued_requests
+    print(f"[REQ-{request_id}] Queued at position {queue_position}. Active: {active_requests}, Queued: {queued_requests}")
+    
+    # Acquire semaphore - this will block if max concurrent requests reached
+    async with request_semaphore:
+        # Now processing - update counters
+        queued_requests -= 1
+        active_requests += 1
+        print(f"[REQ-{request_id}] Starting processing (was at queue position {queue_position}). Active: {active_requests}, Queued: {queued_requests}")
+        
+        try:
+            result = await _process_graphrag(body, request_id, request)
+            return result
+        finally:
+            # Always decrement active counter
+            active_requests -= 1
+            print(f"[REQ-{request_id}] Completed. Active: {active_requests}, Queued: {queued_requests}")
+
+async def _process_graphrag(body: RagBody, request_id: int, request: Request):
+    """Internal function to process graphrag request"""
     try:
         if not body.question.strip():
             return {"success": False, "message": "Please provide a question.", "answer": "", "facts": "", "seeds": []}
@@ -207,11 +257,13 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         labels = body.labels or DEFAULT_LABELS
 
         # 1) Embed question (AWAIT)
+        print(f"[REQ-{request_id}] Step 1: Embedding question")
         t = perf_counter()
         qvec = await get_question_embedding(q0, request=request)
         timings["embed"] = perf_counter() - t
 
         # 2) Hybrid candidates (vector + keyword)
+        print(f"[REQ-{request_id}] Step 2: Hybrid candidates search")
         t = perf_counter()
         cands = hybrid_candidates(
             question=q0, qvec=qvec, labels=labels,
@@ -219,6 +271,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
             alpha_vec=body.alpha_vec, beta_kw=body.beta_kw
         )
         timings["hybrid"] = perf_counter() - t
+        print(f"[REQ-{request_id}] Found {len(cands)} candidates")
 
         # 3) Early "no data" check
         if not cands:
@@ -257,6 +310,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
             timings["cross_doc"] = perf_counter() - t
 
         # 6) Expand neighbors
+        print(f"[REQ-{request_id}] Step 6: Expanding neighbors")
         t = perf_counter()
         raw_seed_ids = [n.element_id for n, _ in cands]
         with driver.session() as s:
@@ -283,8 +337,10 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
             max_hops=max(1, min(body.hops, 3))
         )
         timings["graph_traverse"] = perf_counter() - t
+        print(f"[REQ-{request_id}] Traversed graph, found {len(expanded)} nodes")
 
         # 7) Format context
+        print(f"[REQ-{request_id}] Step 7: Formatting context")
         t = perf_counter()
         facts = format_graph_context(expanded, max_lines=None, snippet_chars=None, include_source=True)
         timings["format_context"] = perf_counter() - t
@@ -321,6 +377,7 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
         ]
 
         timings["total"] = perf_counter() - t_total
+        print(f"[REQ-{request_id}] Completed successfully in {timings['total']:.3f}s")
         print(f"[TIMINGS] {timings}")
 
         return {
@@ -342,20 +399,41 @@ async def graphrag(body: RagBody = Body(...), request: Request = None):  # async
             "timings": timings,
         }
 
-    except Exception as e:
+    except ServiceUnavailable as e:
         # Log server-side
-        print(f"graphrag error: {e}")
-        return {"success": False, "message": "Query failed. No knowledge able to be retrieved. Error:" + str(e)}
+        print(f"Neo4j connection error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False, 
+            "message": "Database temporarily unavailable. Please try again.",
+            "error_type": "connection",
+            "error_details": str(e) if str(e) else repr(e)
+        }
+    except Exception as e:
+        # Log server-side with more details
+        error_type = type(e).__name__
+        error_message = str(e) if str(e) else repr(e)
+        print(f"graphrag error [{error_type}]: {error_message}")
+        import traceback
+        full_traceback = traceback.format_exc()
+        print(f"Full traceback:\n{full_traceback}")
+        return {
+            "success": False, 
+            "message": f"Query failed. No knowledge able to be retrieved. Error: {error_message}",
+            "error_type": error_type,
+            "error_details": error_message
+        }
     
 @app.post("/debug-search")
-def debug_search(body: dict = Body(...)):
+async def debug_search(body: dict = Body(...)):
     """Debug endpoint to test search components separately"""
     try:
         question = body.get("question", "test")
         print(f"Debug search for: {question}")
         
-        # Test vector search
-        qvec = get_question_embedding(question)
+        # Test vector search (await the async function)
+        qvec = await get_question_embedding(question)
 
         # Test hybrid
         hybrid_results = hybrid_candidates(question, qvec, DEFAULT_LABELS, k_vec=5, k_kw=5)

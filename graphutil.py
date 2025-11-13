@@ -42,7 +42,8 @@ async def init_clients():
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             },
-            timeout=10.0
+            timeout=httpx.Timeout(30.0, connect=10.0),  # Increased from 10s, separate connect timeout
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)  # Connection pooling
         )
 
     CHAT_MODEL = _openai["chat_deployment"]
@@ -77,15 +78,27 @@ def _get_providers():
 # ===============================
 # Embedding Functions
 # ===============================
-def _azure_embed(text: str) -> List[float]:
-    """Sync embedding call to Azure OpenAI."""
+def _azure_embed(text: str, max_retries: int = 3) -> List[float]:
+    """Sync embedding call to Azure OpenAI with retry logic."""
     print("[DEBUG] >>> Using Azure sync embedding path")
-    resp = client.embeddings.create(input=[text], model=_openai["embedding_deployment"])
-    return resp.data[0].embedding
+    
+    for attempt in range(max_retries):
+        try:
+            resp = client.embeddings.create(input=[text], model=_openai["embedding_deployment"])
+            return resp.data[0].embedding
+        except Exception as e:
+            error_name = type(e).__name__
+            if attempt < max_retries - 1:
+                wait_time = 0.5 * (2 ** attempt)  # Exponential backoff
+                print(f"[AZURE-EMBED-RETRY] Attempt {attempt + 1}/{max_retries} failed with {error_name}: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"[AZURE-EMBED-ERROR] All {max_retries} attempts failed: {error_name}: {e}")
+                raise
 
 
-async def _sains_vllm_embed(text: str, request=None) -> List[float]:
-    """Async embedding call to vLLM server (diagnostic timing)."""
+async def _sains_vllm_embed(text: str, request=None, max_retries: int = 3) -> List[float]:
+    """Async embedding call to vLLM server with retry logic."""
     print("[DEBUG] >>> Using vLLM async embedding path")
     _, _cfg, _ = _get_providers()
     sains_cfg = _cfg.get("sains_vllm", {})
@@ -96,23 +109,48 @@ async def _sains_vllm_embed(text: str, request=None) -> List[float]:
 
     payload = {"model": model, "input": [text]}
 
-    t0 = time.perf_counter()
-    resp = await session.post(f"{base_url}/embeddings", json=payload)
-    elapsed = time.perf_counter() - t0
-    print(f"[DEBUG] Embedding HTTP call took {elapsed:.3f}s, status={resp.status_code}")
-    resp.raise_for_status()
-    return resp.json()["data"][0]["embedding"]
+    for attempt in range(max_retries):
+        try:
+            t0 = time.perf_counter()
+            resp = await session.post(f"{base_url}/embeddings", json=payload)
+            t1 = time.perf_counter()
+            print(f"[DEBUG] <<< vLLM call took {t1 - t0:.3f}s")
+
+            resp.raise_for_status()
+            data = resp.json()
+            return data["data"][0]["embedding"]
+        except Exception as e:
+            error_name = type(e).__name__
+            if attempt < max_retries - 1:
+                wait_time = 0.5 * (2 ** attempt)
+                print(f"[VLLM-EMBED-RETRY] Attempt {attempt + 1}/{max_retries} failed with {error_name}: {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"[VLLM-EMBED-ERROR] All {max_retries} attempts failed: {error_name}: {e}")
+                raise
 
 
-async def get_question_embedding(question: str, request=None) -> List[float]:
-    """Return embedding, async for vLLM."""
+async def get_question_embedding(question: str, request=None, max_retries: int = 3) -> List[float]:
+    """Return embedding with retry logic for connection errors."""
     provider, *_ = _get_providers()
     print(provider)
-    if provider == "sains_vllm":
-        print("Hi")
-        return await _sains_vllm_embed(question, request=request)
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _azure_embed, question)
+    
+    for attempt in range(max_retries):
+        try:
+            if provider == "sains_vllm":
+                print("Hi")
+                return await _sains_vllm_embed(question, request=request)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, _azure_embed, question)
+        except Exception as e:
+            error_name = type(e).__name__
+            if attempt < max_retries - 1:
+                wait_time = 0.5 * (2 ** attempt)  # Exponential backoff: 0.5s, 1s, 2s
+                print(f"[EMBED-RETRY] Attempt {attempt + 1}/{max_retries} failed with {error_name}: {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"[EMBED-ERROR] All {max_retries} attempts failed: {error_name}: {e}")
+                raise  # Re-raise after all retries exhausted
 
 
 # ===============================
@@ -268,51 +306,57 @@ def _fulltext_query_string(terms: List[str]) -> str:
 def fulltext_search(question: str, limit: int = 12, labels: Optional[List[str]] = None) -> List[Tuple[Any, float]]:
     """BM25 full-text search using Neo4j full-text index, anchored on key phrases."""
     labels = labels or DEFAULT_LABELS
-    with driver.session() as s:
-        _ensure_fulltext_index(s, labels)
-        anchors = _anchor_terms(question, max_terms=3)
-        kws     = _extract_keywords(question, max_terms=8)
-        terms: List[str] = []
-        seen = set()
-        for t in anchors + kws:
-            t = (t or "").strip()
-            if not t:
-                continue
-            if t.lower() in seen:
-                continue
-            terms.append(t)
-            seen.add(t.lower())
+    try:
+        with driver.session() as s:
+            _ensure_fulltext_index(s, labels)
+            anchors = _anchor_terms(question, max_terms=3)
+            kws     = _extract_keywords(question, max_terms=8)
+            terms: List[str] = []
+            seen = set()
+            for t in anchors + kws:
+                t = (t or "").strip()
+                if not t:
+                    continue
+                if t.lower() in seen:
+                    continue
+                terms.append(t)
+                seen.add(t.lower())
 
-        q = _fulltext_query_string(terms)
-        if not q:
-            return []
+            q = _fulltext_query_string(terms)
+            if not q:
+                return []
 
-        lim = max(limit, 16)
+            lim = max(limit, 16)
 
-        res = s.run(
-            """
-            CALL db.index.fulltext.queryNodes($name, $q, {limit: $lim})
-            YIELD node, score
-            RETURN node, score
-            """,
-            name=FTS_NAME, q=q, lim=lim
-        )
-        hits = [(r["node"], float(r["score"])) for r in res]
+            res = s.run(
+                """
+                CALL db.index.fulltext.queryNodes($name, $q, {limit: $lim})
+                YIELD node, score
+                RETURN node, score
+                """,
+                name=FTS_NAME, q=q, lim=lim
+            )
+            hits = [(r["node"], float(r["score"])) for r in res]
 
-        if not hits and anchors:
-            aq = _fulltext_query_string(anchors[:1])
-            if aq:
-                res2 = s.run(
-                    """
-                    CALL db.index.fulltext.queryNodes($name, $q, {limit: $lim})
-                    YIELD node, score
-                    RETURN node, score
-                    """,
-                    name=FTS_NAME, q=aq, lim=lim
-                )
-                hits = [(r["node"], float(r["score"])) for r in res2]
+            if not hits and anchors:
+                aq = _fulltext_query_string(anchors[:1])
+                if aq:
+                    res2 = s.run(
+                        """
+                        CALL db.index.fulltext.queryNodes($name, $q, {limit: $lim})
+                        YIELD node, score
+                        RETURN node, score
+                        """,
+                        name=FTS_NAME, q=aq, lim=lim
+                    )
+                    hits = [(r["node"], float(r["score"])) for r in res2]
 
-        return hits[:limit]
+            return hits[:limit]
+    except Exception as e:
+        print(f"ERROR in fulltext_search: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 # =========================
 # Vector search (base)
@@ -506,27 +550,59 @@ def traverse_neighbors(seed_element_ids: List[str],
     Expand neighborhood around seeds. Uses APOC if present; otherwise pure Cypher.
     Neo4j 5 compatible.
     """
-    with driver.session() as s:
-        try:
-            apoc_ok = s.run("""
-                SHOW PROCEDURES YIELD name
-                WHERE name = 'apoc.path.expandConfig'
-                RETURN count(*) AS c
-            """).single()["c"] > 0
-        except Exception:
-            apoc_ok = False
+    if not seed_element_ids:
+        return {"nodes": [], "rels": []}
+    
+    try:
+        with driver.session() as s:
+            try:
+                apoc_ok = s.run("""
+                    SHOW PROCEDURES YIELD name
+                    WHERE name = 'apoc.path.expandConfig'
+                    RETURN count(*) AS c
+                """).single()["c"] > 0
+            except Exception:
+                apoc_ok = False
 
-        if apoc_ok:
+            if apoc_ok:
+                q = """
+                MATCH (n)
+                WHERE elementId(n) IN $ids
+                CALL apoc.path.expandConfig(n, {
+                  minLevel: 1,
+                  maxLevel: $hops,
+                  uniqueness: "NODE_GLOBAL",
+                  bfs: true
+                }) YIELD path
+                WITH collect(path) AS paths
+                UNWIND paths AS p
+                WITH collect(nodes(p)) AS nlists, collect(relationships(p)) AS rlists
+                UNWIND nlists AS nl
+                UNWIND nl AS n
+                WITH collect(DISTINCT n) AS ns, rlists
+                UNWIND rlists AS rl
+                UNWIND rl AS r
+                WITH ns, collect(DISTINCT r) AS rs2
+                RETURN
+                  [x IN ns | {props: properties(x), labels: labels(x), id: elementId(x)}] AS nodes,
+                  [r IN rs2 | {
+                      type: type(r),
+                      props: properties(r),
+                      start: elementId(startNode(r)),
+                      end: elementId(endNode(r))
+                  }] AS rels
+                """
+                rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
+                if rec is None:
+                    return {"nodes": [], "rels": []}
+                return {"nodes": rec["nodes"] or [], "rels": rec["rels"] or []}
+
+            # ---------- Pure Cypher fallback (no APOC at all) ----------
             q = """
             MATCH (n)
             WHERE elementId(n) IN $ids
-            CALL apoc.path.expandConfig(n, {
-              minLevel: 1,
-              maxLevel: $hops,
-              uniqueness: "NODE_GLOBAL",
-              bfs: true
-            }) YIELD path
-            WITH collect(path) AS paths
+            MATCH p=(n)-[*1..$hops]-(m)
+            WITH collect(p) AS paths
             UNWIND paths AS p
             WITH collect(nodes(p)) AS nlists, collect(relationships(p)) AS rlists
             UNWIND nlists AS nl
@@ -545,33 +621,15 @@ def traverse_neighbors(seed_element_ids: List[str],
               }] AS rels
             """
             rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
-            return {"nodes": rec["nodes"], "rels": rec["rels"]}
-
-        # ---------- Pure Cypher fallback (no APOC at all) ----------
-        q = """
-        MATCH (n)
-        WHERE elementId(n) IN $ids
-        MATCH p=(n)-[*1..$hops]-(m)
-        WITH collect(p) AS paths
-        UNWIND paths AS p
-        WITH collect(nodes(p)) AS nlists, collect(relationships(p)) AS rlists
-        UNWIND nlists AS nl
-        UNWIND nl AS n
-        WITH collect(DISTINCT n) AS ns, rlists
-        UNWIND rlists AS rl
-        UNWIND rl AS r
-        WITH ns, collect(DISTINCT r) AS rs2
-        RETURN
-          [x IN ns | {props: properties(x), labels: labels(x), id: elementId(x)}] AS nodes,
-          [r IN rs2 | {
-              type: type(r),
-              props: properties(r),
-              start: elementId(startNode(r)),
-              end: elementId(endNode(r))
-          }] AS rels
-        """
-        rec = s.run(q, ids=seed_element_ids, hops=max_hops).single()
-        return {"nodes": rec["nodes"], "rels": rec["rels"]}
+            if rec is None:
+                return {"nodes": [], "rels": []}
+            return {"nodes": rec["nodes"] or [], "rels": rec["rels"] or []}
+    except Exception as e:
+        print(f"ERROR in traverse_neighbors: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return empty result instead of crashing
+        return {"nodes": [], "rels": []}
 
 # --------- Dedup helpers ---------
 _NUM_WORDS = {
