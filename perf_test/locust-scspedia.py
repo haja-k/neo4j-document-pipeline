@@ -19,7 +19,7 @@ sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer)
 # CONFIG
 # ========================================
 
-API_URL = "https://knowledge-graph.sains.com.my/graphrag"
+API_URL = "https://knowledge-graph.com.my/graphrag" # replace URL
 # API_KEY removed as per new requirements
 
 MAX_USERS = 50
@@ -64,7 +64,7 @@ QUESTIONS = [
 # LOCUST USER CLASS
 # ========================================
 class ChatUser(HttpUser):
-    host = "https://knowledge-graph.sains.com.my/"
+    host = "https://knowledge-graph.com.my/" # replace URL
     wait_time = between(0, 0)
     
     def on_start(self):
