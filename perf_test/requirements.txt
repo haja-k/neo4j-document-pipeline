@@ -2,7 +2,7 @@
 requests
 pandas
 openpyxl
-
+dotenv
 # Optional but recommended for better console output
 rich
 

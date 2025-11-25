@@ -42,7 +42,7 @@ async def init_clients():
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             },
-            timeout=httpx.Timeout(30.0, connect=10.0),  # Increased from 10s, separate connect timeout
+            timeout=httpx.Timeout(120.0, connect=10.0),  # 2 min timeout for high load, 10s connect timeout
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)  # Connection pooling
         )
 

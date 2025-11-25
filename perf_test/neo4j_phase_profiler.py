@@ -80,12 +80,12 @@ class Config:
     OUTPUT_DIR = Path("test_results")
     
     # Load test parameters
-    MIN_USERS = 1
-    MAX_USERS = 50
-    USERS_INCREMENT = 5
-    WAIT_BETWEEN_STEPS = 3
+    MIN_USERS = 2
+    MAX_USERS = 100
+    USERS_INCREMENT = 4
+    WAIT_BETWEEN_STEPS = 5
     
-    REQUEST_TIMEOUT = 120  # seconds
+    REQUEST_TIMEOUT = None  # No timeout - wait indefinitely
     MAX_RETRIES = 2
     RETRY_DELAY = 2
     
@@ -169,6 +169,10 @@ class RequestResult:
     # Metadata
     seeds_count: int = 0
     facts_length: int = 0
+    answer: str = ""
+    
+    # Embedding metrics
+    concurrent_embeds: int = 0  # Number of concurrent embedding requests in this step
     
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -213,6 +217,11 @@ class StepMetrics:
     
     # Throughput metrics
     throughput_rps: float
+    
+    # Request capacity metrics
+    request_throughput: float  # Requests per second (wall-clock)
+    avg_embeddings_per_request: float
+    total_embedding_requests: int
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -306,6 +315,7 @@ class GraphRAGClient:
                             # Extract metadata
                             result.seeds_count = len(data.get("seeds", []))
                             result.facts_length = len(data.get("facts", ""))
+                            result.answer = data.get("answer", "")
                             
                             return result
                         else:
@@ -377,6 +387,7 @@ class PhaseProfiler:
             for future in concurrent.futures.as_completed(futures):
                 try:
                     result = future.result()
+                    result.concurrent_embeds = num_users  # Track concurrent load
                     results.append(result)
                 except Exception as e:
                     if RICH_AVAILABLE:
@@ -386,7 +397,7 @@ class PhaseProfiler:
         
         return results
     
-    def calculate_step_metrics(self, results: List[RequestResult], step: int, concurrent_users: int) -> StepMetrics:
+    def calculate_step_metrics(self, results: List[RequestResult], step: int, concurrent_users: int, step_duration_sec: float = 0) -> StepMetrics:
         """Calculate aggregated phase metrics"""
         total = len(results)
         successful = sum(1 for r in results if r.success)
@@ -431,6 +442,12 @@ class PhaseProfiler:
         avg_response_time_sec = avg(total_times) / 1000 if total_times else 0
         throughput_rps = concurrent_users / avg_response_time_sec if avg_response_time_sec > 0 else 0
         
+        # Calculate request throughput
+        # Each successful request does 1 embedding call
+        # Real throughput = total requests completed / wall-clock time
+        total_embedding_requests = successful  # 1 embedding per successful request
+        request_throughput = successful / step_duration_sec if step_duration_sec > 0 else 0
+        
         return StepMetrics(
             step=step,
             concurrent_users=concurrent_users,
@@ -459,6 +476,10 @@ class PhaseProfiler:
             slowest_phase=slowest_phase,
             slowest_phase_avg_ms=slowest_phase_avg,
             throughput_rps=throughput_rps,
+            
+            request_throughput=request_throughput,
+            avg_embeddings_per_request=1.0,  # Currently 1 embedding per request
+            total_embedding_requests=total_embedding_requests,
         )
     
     def run_test(self):
@@ -482,18 +503,23 @@ class PhaseProfiler:
                 step_results = self.run_concurrent_requests(num_users, step)
                 step_duration = time.perf_counter() - step_start
                 
-                metrics = self.calculate_step_metrics(step_results, step, num_users)
+                metrics = self.calculate_step_metrics(step_results, step, num_users, step_duration)
                 self.all_results.extend(step_results)
                 self.step_metrics.append(metrics)
                 
                 self._display_step_results(metrics)
 
                 # Check for failed requests and stop if any
-                if any(not r.success for r in step_results):
+                failed_results = [r for r in step_results if not r.success]
+                if failed_results:
                     if RICH_AVAILABLE:
-                        console.print("[red]❌ Failed request detected. Stopping test.[/red]")
+                        console.print(f"[red]❌ Failed request detected ({len(failed_results)}/{len(step_results)} failed). Stopping test.[/red]")
+                        for fr in failed_results:
+                            console.print(f"[red]   Error: {fr.error_message} | Status: {fr.status_code}[/red]")
                     else:
-                        print("❌ Failed request detected. Stopping test.")
+                        print(f"❌ Failed request detected ({len(failed_results)}/{len(step_results)} failed). Stopping test.")
+                        for fr in failed_results:
+                            print(f"   Error: {fr.error_message} | Status: {fr.status_code}")
                     break
                 
                 if num_users < self.config.MAX_USERS:
@@ -565,6 +591,8 @@ class PhaseProfiler:
             console.print(table)
             console.print(f"[yellow]⚠️  Bottleneck: {m.slowest_phase} ({m.slowest_phase_avg_ms:.1f}ms)[/yellow]")
             console.print(f"Success Rate: [green]{m.success_rate:.1f}%[/green]")
+            console.print(f"[cyan]📊 Request Throughput: {m.request_throughput:.2f} req/sec[/cyan] | "
+                         f"[dim]Avg embed time: {m.avg_embed_ms:.0f}ms (concurrent: {m.concurrent_users})[/dim]")
         else:
             print(f"  Avg Total: {m.avg_total_request_ms:.1f}ms")
             print(f"  - Embedding: {m.avg_embed_ms:.1f}ms")
@@ -573,6 +601,7 @@ class PhaseProfiler:
             print(f"  - Network Overhead: {m.avg_network_overhead_ms:.1f}ms")
             print(f"  Bottleneck: {m.slowest_phase} ({m.slowest_phase_avg_ms:.1f}ms)")
             print(f"  Success Rate: {m.success_rate:.1f}%")
+            print(f"  Request Throughput: {m.request_throughput:.2f} req/sec | Avg embed time: {m.avg_embed_ms:.0f}ms (concurrent: {m.concurrent_users})")
     
     def _display_summary(self):
         """Display final summary"""
@@ -585,6 +614,7 @@ class PhaseProfiler:
             table.add_column("Search", justify="right")
             table.add_column("Traverse", justify="right")
             table.add_column("Total", justify="right")
+            table.add_column("Req/s", justify="right", style="cyan")
             table.add_column("Bottleneck", style="yellow")
             
             for m in self.step_metrics:
@@ -594,6 +624,7 @@ class PhaseProfiler:
                     f"{m.avg_hybrid_ms:.0f}",
                     f"{m.avg_graph_traverse_ms:.0f}",
                     f"{m.avg_total_request_ms:.0f}",
+                    f"{m.request_throughput:.1f}",
                     m.slowest_phase
                 )
             
@@ -603,7 +634,8 @@ class PhaseProfiler:
             for m in self.step_metrics:
                 print(f"Users: {m.concurrent_users} | Embed: {m.avg_embed_ms:.0f}ms | "
                       f"Search: {m.avg_hybrid_ms:.0f}ms | Traverse: {m.avg_graph_traverse_ms:.0f}ms | "
-                      f"Total: {m.avg_total_request_ms:.0f}ms | Bottleneck: {m.slowest_phase}")
+                      f"Total: {m.avg_total_request_ms:.0f}ms | Req/s: {m.request_throughput:.1f} | "
+                      f"Bottleneck: {m.slowest_phase}")
     
     def _save_results(self):
         """Save results to Excel with rich formatting and charts"""
