@@ -80,9 +80,9 @@ class Config:
     OUTPUT_DIR = Path("test_results")
     
     # Load test parameters
-    MIN_USERS = 2
+    MIN_USERS = 80
     MAX_USERS = 100
-    USERS_INCREMENT = 4
+    USERS_INCREMENT = 5
     WAIT_BETWEEN_STEPS = 5
     
     REQUEST_TIMEOUT = None  # No timeout - wait indefinitely
