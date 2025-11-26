@@ -1,4 +1,64 @@
-# Changelog - Enhanced Performance Test
+# Changelog - Performance Testing Tools
+
+## [3.0.0] - 2025-11-18
+
+### 🔍 Neo4j Phase Profiler (NEW)
+
+**New Tool:** Detailed timing analysis for each phase of Neo4j GraphRAG operations
+
+#### What It Measures
+- **Embedding Phase:** Vector generation time (200-500ms typical)
+- **Hybrid Search Phase:** Neo4j vector + fulltext search (250-500ms typical)
+- **MMR Diversification:** Result diversification (20-100ms typical)
+- **Cross-Document Coverage:** Multi-document selection (50-150ms typical)
+- **Graph Traversal Phase:** Neo4j neighborhood expansion (300-800ms typical)
+- **Format Context Phase:** Text formatting (100-300ms typical)
+
+#### Derived Metrics
+- **Neo4j Read Time** = hybrid_search + graph_traverse
+- **Total Processing Time** = Sum of all phases
+- **Network Overhead** = total_request - processing
+
+#### Key Features
+- Identifies bottleneck phases automatically
+- Tracks performance degradation under load
+- Per-phase P95 latency tracking
+- Excel reports with phase breakdown
+- Optimization recommendations
+
+#### Files
+- `neo4j_phase_profiler.py` - Main profiler script
+- `PHASE_PROFILER_README.md` - Usage guide
+- `PHASES_EXPLAINED.md` - Detailed phase documentation
+- `run_phase_profiler.ps1` - Windows quick start
+- `run_phase_profiler.sh` - Linux/Mac quick start
+
+#### Usage
+```bash
+python neo4j_phase_profiler.py
+```
+
+#### Example Output
+```
+Phase Timing Breakdown
+┌──────────────────┬──────────┬──────────┬──────────┐
+│ Phase            │ Avg (ms) │ P95 (ms) │ % Total  │
+├──────────────────┼──────────┼──────────┼──────────┤
+│ Embedding        │  450.2   │  520.1   │  25.3%   │
+│ Hybrid Search    │  280.5   │  310.2   │  15.8%   │
+│ Graph Traverse   │  650.8   │  720.5   │  36.6%   │  ← BOTTLENECK
+│ Neo4j Read Total │  931.3   │  980.7   │  52.4%   │
+└──────────────────┴──────────┴──────────┴──────────┘
+```
+
+#### When to Use
+- Understanding where time is spent in queries
+- Identifying performance bottlenecks
+- Before/after optimization comparisons
+- Validating Neo4j index performance
+- Checking embedding service health
+
+---
 
 ## [2.1.0] - 2025-11-07
 
