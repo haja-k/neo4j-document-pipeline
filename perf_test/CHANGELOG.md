@@ -1,5 +1,67 @@
 # Changelog - Performance Testing Tools
 
+## [3.2.0] - 2025-11-26
+
+### 🔧 Neo4j Phase Profiler - Enhanced Metrics & Configuration
+
+**Updates:** Improved throughput tracking and test configuration flexibility
+
+#### New Features
+- **Request Throughput Tracking:** Real wall-clock requests per second (req/sec) measurement
+  - Displays actual request completion rate during load tests
+  - Separate from theoretical throughput calculations
+  - Helps identify true system capacity under concurrent load
+
+- **Embedding Request Metrics:** Track concurrent embedding load
+  - Records number of concurrent embedding requests per step
+  - Calculates embeddings per request (currently 1:1 ratio)
+  - Useful for understanding embedding service pressure
+
+- **Enhanced Error Reporting:** Detailed failure information
+  - Shows number of failed vs total requests on failure
+  - Displays error messages and status codes for each failed request
+  - Helps identify failure patterns during load testing
+
+- **Answer Field Extraction:** Captures full API response answer
+  - Stores generated answer text in results
+  - Enables response quality analysis alongside performance metrics
+
+#### Configuration Updates
+- **Timeout Configuration:** Changed from fixed 120s to `None` (wait indefinitely)
+  - Prevents premature test termination during high load
+  - Better for stress testing to breaking point
+  - Can be customized based on test requirements
+
+- **Load Test Range:** Configurable starting point
+  - Changed `MIN_USERS` from 1 to 40 (default, adjustable)
+  - Supports jumping to specific load levels (e.g., 80 users)
+  - `MAX_USERS` remains at 100
+  - `USERS_INCREMENT` set to 4-5 users per step
+
+#### Display Improvements
+- **Request Throughput Column:** Added to summary tables
+  - Shows "Req/s" in cyan for easy identification
+  - Displayed alongside traditional metrics
+  - Helps compare actual vs theoretical performance
+
+- **Console Output:** Enhanced step results display
+  - Real-time request throughput: "📊 Request Throughput: X.XX req/sec"
+  - Shows average embedding time with concurrent user count
+  - More informative failure messages with counts
+
+#### Internal Improvements
+- Step duration tracking for accurate throughput calculation
+- Wall-clock time measurement for request completion rates
+- Better separation of derived vs measured metrics
+
+#### When to Use These Features
+- **Request Throughput:** Measuring actual API capacity in production-like scenarios
+- **Embedding Metrics:** Diagnosing embedding service bottlenecks
+- **Enhanced Errors:** Troubleshooting partial failures at scale
+- **Timeout Changes:** Stress testing to absolute breaking point
+
+---
+
 ## [3.0.0] - 2025-11-18
 
 ### 🔍 Neo4j Phase Profiler (NEW)

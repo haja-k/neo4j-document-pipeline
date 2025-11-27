@@ -68,6 +68,13 @@ except ImportError:
     class Side:
         def __init__(self, **kwargs): pass
 
+# System metrics (optional)
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
 # ========================================
 # CONFIGURATION
 # ========================================
@@ -80,7 +87,7 @@ class Config:
     OUTPUT_DIR = Path("test_results")
     
     # Load test parameters
-    MIN_USERS = 80
+    MIN_USERS = 40
     MAX_USERS = 100
     USERS_INCREMENT = 5
     WAIT_BETWEEN_STEPS = 5
@@ -210,10 +217,14 @@ class StepMetrics:
     p95_graph_traverse_ms: float
     p95_neo4j_read_ms: float
     p95_total_request_ms: float
+    p95_total_processing_ms: float
+    p95_network_overhead_ms: float
     
     # Bottleneck identification
     slowest_phase: str
     slowest_phase_avg_ms: float
+    slowest_phase_pct: float
+    cause_label: str
     
     # Throughput metrics
     throughput_rps: float
@@ -222,6 +233,16 @@ class StepMetrics:
     request_throughput: float  # Requests per second (wall-clock)
     avg_embeddings_per_request: float
     total_embedding_requests: int
+    # Host metrics (optional)
+    avg_cpu_percent: float = 0.0
+    avg_cpu_iowait_percent: float = 0.0
+    avg_mem_percent: float = 0.0
+    avg_swap_percent: float = 0.0
+    load1_per_core_avg: float = 0.0
+    net_rx_mb_s: float = 0.0
+    net_tx_mb_s: float = 0.0
+    disk_read_mb_s: float = 0.0
+    disk_write_mb_s: float = 0.0
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -425,21 +446,41 @@ class PhaseProfiler:
         def avg(vals): return statistics.mean(vals) if vals else 0
         def p95(vals): return statistics.quantiles(vals, n=20)[18] if len(vals) > 1 else (vals[0] if vals else 0)
         
-        # Identify bottleneck
+        # Identify bottleneck including client-side/network overhead and derived totals
         phase_avgs = {
             "embedding": avg(embed_times),
             "hybrid_search": avg(hybrid_times),
             "graph_traverse": avg(traverse_times),
             "format_context": avg(format_times),
+            "network_overhead": avg(network_times),
+            "neo4j_read_total": avg(neo4j_read_times),
+            "processing_total": avg(processing_times),
         }
         slowest_phase = max(phase_avgs, key=phase_avgs.get) if phase_avgs else "unknown"
         slowest_phase_avg = phase_avgs.get(slowest_phase, 0)
+        avg_total_ms = avg(total_times)
+        slowest_phase_pct = (slowest_phase_avg / avg_total_ms * 100) if avg_total_ms > 0 else 0
+
+        # Classify likely cause
+        def classify_bottleneck(key: str) -> str:
+            key = key or ""
+            if key == "embedding":
+                return "embedding_service"
+            if key in ("graph_traverse", "hybrid_search", "neo4j_read_total"):
+                return "neo4j_database"
+            if key == "format_context":
+                return "application_processing"
+            if key in ("network_overhead", "processing_total"):
+                return "client_api_overhead"
+            return "unknown"
+
+        cause_label = classify_bottleneck(slowest_phase)
         
         # Calculate throughput (requests per second)
         # Use the step duration from the calling method, but since we don't have it here,
         # we'll calculate it based on concurrent users and average response time
         # Throughput = concurrent_users / (avg_response_time / 1000)
-        avg_response_time_sec = avg(total_times) / 1000 if total_times else 0
+        avg_response_time_sec = avg_total_ms / 1000 if total_times else 0
         throughput_rps = concurrent_users / avg_response_time_sec if avg_response_time_sec > 0 else 0
         
         # Calculate request throughput
@@ -472,14 +513,27 @@ class PhaseProfiler:
             p95_graph_traverse_ms=p95(traverse_times),
             p95_neo4j_read_ms=p95(neo4j_read_times),
             p95_total_request_ms=p95(total_times),
-            
+            p95_total_processing_ms=p95(processing_times),
+            p95_network_overhead_ms=p95(network_times),
+
             slowest_phase=slowest_phase,
             slowest_phase_avg_ms=slowest_phase_avg,
+            slowest_phase_pct=slowest_phase_pct,
+            cause_label=cause_label,
             throughput_rps=throughput_rps,
-            
+
             request_throughput=request_throughput,
             avg_embeddings_per_request=1.0,  # Currently 1 embedding per request
             total_embedding_requests=total_embedding_requests,
+            avg_cpu_percent=getattr(self, "_last_step_cpu_avg", 0.0),
+            avg_cpu_iowait_percent=getattr(self, "_last_step_cpu_iowait_avg", 0.0),
+            avg_mem_percent=getattr(self, "_last_step_mem_avg", 0.0),
+            avg_swap_percent=getattr(self, "_last_step_swap_avg", 0.0),
+            load1_per_core_avg=getattr(self, "_last_step_load1_per_core_avg", 0.0),
+            net_rx_mb_s=getattr(self, "_last_step_net_rx_mb_s", 0.0),
+            net_tx_mb_s=getattr(self, "_last_step_net_tx_mb_s", 0.0),
+            disk_read_mb_s=getattr(self, "_last_step_disk_read_mb_s", 0.0),
+            disk_write_mb_s=getattr(self, "_last_step_disk_write_mb_s", 0.0),
         )
     
     def run_test(self):
@@ -499,9 +553,104 @@ class PhaseProfiler:
                 else:
                     print(f"\n📊 Step {step}: {num_users} concurrent users")
                 
+                # Start system monitor (optional)
+                cpu_samples = []
+                iowait_samples = []
+                mem_samples = []
+                swap_samples = []
+                load1_samples = []
+                stop_event = threading.Event()
+
+                # Baselines for IO counters
+                if PSUTIL_AVAILABLE:
+                    try:
+                        disk_io_start = psutil.disk_io_counters()
+                        net_io_start = psutil.net_io_counters()
+                    except Exception:
+                        disk_io_start = None
+                        net_io_start = None
+
+                def sys_monitor():
+                    if not PSUTIL_AVAILABLE:
+                        return
+                    while not stop_event.is_set():
+                        try:
+                            # Use cpu_times_percent with interval to also capture iowait
+                            t = psutil.cpu_times_percent(interval=0.5)
+                            cpu_percent = 100.0 - getattr(t, 'idle', 0.0)
+                            cpu_samples.append(cpu_percent)
+                            iowait_samples.append(getattr(t, 'iowait', 0.0) or 0.0)
+
+                            vm = psutil.virtual_memory()
+                            mem_samples.append(getattr(vm, 'percent', 0.0) or 0.0)
+                            sw = psutil.swap_memory()
+                            swap_samples.append(getattr(sw, 'percent', 0.0) or 0.0)
+
+                            try:
+                                la1, la5, la15 = os.getloadavg()
+                                cores = psutil.cpu_count(logical=True) or 1
+                                load1_samples.append(la1 / cores)
+                            except Exception:
+                                pass
+                        except Exception:
+                            break
+
+                monitor_thread = None
+                if PSUTIL_AVAILABLE:
+                    monitor_thread = threading.Thread(target=sys_monitor, daemon=True)
+                    monitor_thread.start()
+
                 step_start = time.perf_counter()
                 step_results = self.run_concurrent_requests(num_users, step)
                 step_duration = time.perf_counter() - step_start
+
+                # Stop system monitor and compute averages/deltas
+                if PSUTIL_AVAILABLE:
+                    stop_event.set()
+                    if monitor_thread:
+                        monitor_thread.join(timeout=1)
+                    self._last_step_cpu_avg = statistics.mean(cpu_samples) if cpu_samples else 0.0
+                    self._last_step_cpu_iowait_avg = statistics.mean(iowait_samples) if iowait_samples else 0.0
+                    self._last_step_mem_avg = statistics.mean(mem_samples) if mem_samples else 0.0
+                    self._last_step_swap_avg = statistics.mean(swap_samples) if swap_samples else 0.0
+                    self._last_step_load1_per_core_avg = statistics.mean(load1_samples) if load1_samples else 0.0
+
+                    # Compute IO bandwidths using deltas
+                    try:
+                        disk_io_end = psutil.disk_io_counters()
+                        net_io_end = psutil.net_io_counters()
+                    except Exception:
+                        disk_io_end = None
+                        net_io_end = None
+
+                    dur = step_duration if step_duration > 0 else 1e-6
+                    if disk_io_start and disk_io_end:
+                        read_mb = max(0.0, (disk_io_end.read_bytes - disk_io_start.read_bytes) / (1024 * 1024))
+                        write_mb = max(0.0, (disk_io_end.write_bytes - disk_io_start.write_bytes) / (1024 * 1024))
+                        self._last_step_disk_read_mb_s = read_mb / dur
+                        self._last_step_disk_write_mb_s = write_mb / dur
+                    else:
+                        self._last_step_disk_read_mb_s = 0.0
+                        self._last_step_disk_write_mb_s = 0.0
+
+                    if net_io_start and net_io_end:
+                        rx_mb = max(0.0, (net_io_end.bytes_recv - net_io_start.bytes_recv) / (1024 * 1024))
+                        tx_mb = max(0.0, (net_io_end.bytes_sent - net_io_start.bytes_sent) / (1024 * 1024))
+                        self._last_step_net_rx_mb_s = rx_mb / dur
+                        self._last_step_net_tx_mb_s = tx_mb / dur
+                    else:
+                        self._last_step_net_rx_mb_s = 0.0
+                        self._last_step_net_tx_mb_s = 0.0
+                else:
+                    self._last_step_cpu_avg = 0.0
+                    self._last_step_cpu_iowait_avg = 0.0
+                    self._last_step_mem_avg = 0.0
+                    self._last_step_swap_avg = 0.0
+                    self._last_step_load1_per_core_avg = 0.0
+                    self._last_step_disk_read_mb_s = 0.0
+                    self._last_step_disk_write_mb_s = 0.0
+                    self._last_step_net_rx_mb_s = 0.0
+                    self._last_step_net_tx_mb_s = 0.0
                 
                 metrics = self.calculate_step_metrics(step_results, step, num_users, step_duration)
                 self.all_results.extend(step_results)
@@ -560,7 +709,9 @@ class PhaseProfiler:
             
             for name, avg_val, p95_val in phases:
                 pct = (avg_val / total * 100) if total > 0 else 0
-                style = "bold red" if name == m.slowest_phase.replace("_", " ").title() else ""
+                # Normalize key names for comparison: "Network Overhead" -> network_overhead, etc.
+                key_name = name.lower().replace(" ", "_")
+                style = "bold red" if key_name == m.slowest_phase else ""
                 table.add_row(
                     name,
                     f"{avg_val:.1f}",
@@ -579,6 +730,14 @@ class PhaseProfiler:
                 f"({neo4j_pct:.1f}%)",
                 style="dim cyan"
             )
+            processing_pct = (m.avg_total_processing_ms / total * 100) if total > 0 else 0
+            table.add_row(
+                "Processing Total",
+                f"{m.avg_total_processing_ms:.1f}",
+                f"{m.p95_total_processing_ms:.1f}",
+                f"({processing_pct:.1f}%)",
+                style="dim"
+            )
             table.add_row("", "", "", "", style="dim")
             table.add_row(
                 "TOTAL REQUEST",
@@ -589,10 +748,16 @@ class PhaseProfiler:
             )
             
             console.print(table)
-            console.print(f"[yellow]⚠️  Bottleneck: {m.slowest_phase} ({m.slowest_phase_avg_ms:.1f}ms)[/yellow]")
+            console.print(f"[yellow]⚠️  Bottleneck: {m.slowest_phase} ({m.slowest_phase_avg_ms:.1f}ms, {m.slowest_phase_pct:.1f}% of total)[/yellow]")
             console.print(f"Success Rate: [green]{m.success_rate:.1f}%[/green]")
             console.print(f"[cyan]📊 Request Throughput: {m.request_throughput:.2f} req/sec[/cyan] | "
                          f"[dim]Avg embed time: {m.avg_embed_ms:.0f}ms (concurrent: {m.concurrent_users})[/dim]")
+            if m.avg_cpu_percent:
+                console.print(f"[dim]🖥️  Host CPU avg during step: {m.avg_cpu_percent:.1f}%[/dim]")
+            if m.avg_mem_percent or m.avg_cpu_iowait_percent:
+                console.print(f"[dim]🧠 Mem avg: {m.avg_mem_percent:.1f}% | ⏳ iowait: {m.avg_cpu_iowait_percent:.1f}% | load1/core: {m.load1_per_core_avg:.2f}[/dim]")
+            if m.net_rx_mb_s or m.net_tx_mb_s or m.disk_read_mb_s or m.disk_write_mb_s:
+                console.print(f"[dim]🌐 Net RX/TX: {m.net_rx_mb_s:.2f}/{m.net_tx_mb_s:.2f} MB/s | 💾 Disk R/W: {m.disk_read_mb_s:.2f}/{m.disk_write_mb_s:.2f} MB/s[/dim]")
         else:
             print(f"  Avg Total: {m.avg_total_request_ms:.1f}ms")
             print(f"  - Embedding: {m.avg_embed_ms:.1f}ms")
@@ -615,6 +780,7 @@ class PhaseProfiler:
             table.add_column("Traverse", justify="right")
             table.add_column("Total", justify="right")
             table.add_column("Req/s", justify="right", style="cyan")
+            table.add_column("Cause", style="magenta")
             table.add_column("Bottleneck", style="yellow")
             
             for m in self.step_metrics:
@@ -625,6 +791,7 @@ class PhaseProfiler:
                     f"{m.avg_graph_traverse_ms:.0f}",
                     f"{m.avg_total_request_ms:.0f}",
                     f"{m.request_throughput:.1f}",
+                    m.cause_label,
                     m.slowest_phase
                 )
             
@@ -764,6 +931,22 @@ class PhaseProfiler:
                 summary_df = pd.DataFrame([m.to_dict() for m in self.step_metrics])
                 summary_df.to_excel(writer, sheet_name="Raw_Metrics", index=False, startrow=1)
 
+                # ===== SYSTEM METRICS SHEET =====
+                system_df = self._create_system_metrics_data()
+                system_df.to_excel(writer, sheet_name="System_Metrics", index=False, startrow=1)
+
+                worksheet = writer.sheets["System_Metrics"]
+                worksheet["A1"] = "System Metrics by Load Level"
+                if EXCEL_STYLING_AVAILABLE:
+                    worksheet["A1"].font = Font(size=14, bold=True, color="366092")
+
+                    for row in worksheet.iter_rows(min_row=2, max_row=len(system_df)+1, min_col=1, max_col=len(system_df.columns)):
+                        for cell in row:
+                            if cell.row == 2:
+                                cell.style = header_style
+                            else:
+                                cell.style = data_style
+
                 worksheet = writer.sheets["Raw_Metrics"]
                 worksheet["A1"] = "Raw Performance Metrics"
                 if EXCEL_STYLING_AVAILABLE:
@@ -800,9 +983,10 @@ class PhaseProfiler:
                 else:
                     console.print(f"[dim]📊 Includes: Dashboard, Phase Breakdown, Performance Trends, Detailed Results, Raw Metrics[/dim]")
                     console.print(f"[yellow]⚠️  Install openpyxl for enhanced styling: pip install openpyxl[/yellow]")
+                console.print(f"[dim]🧰 Added: System_Metrics sheet for CPU/Mem/Load/IO per step[/dim]")
             else:
                 print(f"✓ Rich Excel report saved to: {filename}")
-                print("📊 Includes: Dashboard, Phase Breakdown, Performance Trends, Detailed Results, Raw Metrics")
+                print("📊 Includes: Dashboard, Phase Breakdown, Performance Trends, Detailed Results, Raw Metrics, System_Metrics")
 
         except Exception as e:
             if RICH_AVAILABLE:
@@ -826,9 +1010,18 @@ class PhaseProfiler:
                 "Average Response Time",
                 "P95 Response Time",
                 "Bottleneck Phase",
+                    "Bottleneck Share",
+                    "Likely Cause",
                 "Neo4j Read Time (Avg)",
                 "Embedding Time (Avg)",
                 "Network Overhead (Avg)",
+                    "Processing Total (Avg)",
+                "Host CPU Avg",
+                "CPU iowait Avg",
+                "Memory Avg",
+                "Load1/Core Avg",
+                "Net RX/TX (MB/s)",
+                "Disk R/W (MB/s)",
                 "Test Duration",
                 "Timestamp"
             ],
@@ -840,9 +1033,18 @@ class PhaseProfiler:
                 f"{latest.avg_total_request_ms:.1f}ms",
                 f"{latest.p95_total_request_ms:.1f}ms",
                 latest.slowest_phase.replace("_", " ").title(),
+                    f"{latest.slowest_phase_pct:.1f}%",
+                    latest.cause_label.replace("_", " "),
                 f"{latest.avg_neo4j_read_ms:.1f}ms",
                 f"{latest.avg_embed_ms:.1f}ms",
                 f"{latest.avg_network_overhead_ms:.1f}ms",
+                    f"{latest.avg_total_processing_ms:.1f}ms",
+                f"{latest.avg_cpu_percent:.1f}%",
+                f"{latest.avg_cpu_iowait_percent:.1f}%",
+                f"{latest.avg_mem_percent:.1f}%",
+                f"{latest.load1_per_core_avg:.2f}",
+                f"{latest.net_rx_mb_s:.2f}/{latest.net_tx_mb_s:.2f}",
+                f"{latest.disk_read_mb_s:.2f}/{latest.disk_write_mb_s:.2f}",
                 f"{len(self.step_metrics)} load steps",
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ]
@@ -871,6 +1073,8 @@ class PhaseProfiler:
                 "Network Overhead (%)": round(m.avg_network_overhead_ms / total * 100, 1),
                 "Neo4j Read Total (ms)": round(m.avg_neo4j_read_ms, 1),
                 "Neo4j Read Total (%)": round(m.avg_neo4j_read_ms / total * 100, 1),
+                "Processing Total (ms)": round(m.avg_total_processing_ms, 1),
+                "Processing Total (%)": round(m.avg_total_processing_ms / total * 100, 1),
                 "Total Request (ms)": round(m.avg_total_request_ms, 1),
                 "Bottleneck": m.slowest_phase.replace("_", " ").title()
             }
@@ -896,6 +1100,26 @@ class PhaseProfiler:
             trend_data.append(row)
 
         return pd.DataFrame(trend_data)
+
+    def _create_system_metrics_data(self) -> pd.DataFrame:
+        """Create system metrics data per step for diagnosis"""
+        rows = []
+        for m in self.step_metrics:
+            rows.append({
+                "Concurrent Users": m.concurrent_users,
+                "CPU Avg (%)": round(m.avg_cpu_percent, 1),
+                "CPU iowait Avg (%)": round(m.avg_cpu_iowait_percent, 1),
+                "Mem Avg (%)": round(m.avg_mem_percent, 1),
+                "Swap Avg (%)": round(m.avg_swap_percent, 1),
+                "Load1/Core Avg": round(m.load1_per_core_avg, 2),
+                "Net RX (MB/s)": round(m.net_rx_mb_s, 2),
+                "Net TX (MB/s)": round(m.net_tx_mb_s, 2),
+                "Disk Read (MB/s)": round(m.disk_read_mb_s, 2),
+                "Disk Write (MB/s)": round(m.disk_write_mb_s, 2),
+                "Bottleneck": m.slowest_phase.replace("_", " ").title(),
+                "Likely Cause": m.cause_label.replace("_", " ")
+            })
+        return pd.DataFrame(rows)
 
 
 # ========================================
